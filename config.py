@@ -8,10 +8,12 @@ class Config:
     API_HASH = os.getenv('TELEGRAM_API_HASH')
     PHONE_NUMBER = os.getenv('TELEGRAM_PHONE')
     CHANNEL_NAME = os.getenv('CHANNEL_NAME')
+    TTL_SECONDS = os.getenv('TTL_SECONDS')
+    AGG_INTERVAL_SEC = os.getenv('AGG_INTERVAL_SEC')
     
     @classmethod
     def validate(cls):
-        required_fields = ['API_ID', 'API_HASH', 'PHONE_NUMBER', 'CHANNEL_NAME']
+        required_fields = ['API_ID', 'API_HASH', 'PHONE_NUMBER', 'CHANNEL_NAME', 'TTL_SECONDS', 'AGG_INTERVAL_SEC']
         missing_fields = []
         
         for field in required_fields:

@@ -1,4 +1,5 @@
 # file: ws_ohlcv_manager.py
+from config import Config
 import time
 import math
 import json
@@ -12,9 +13,11 @@ import websocket  # pip install websocket-client
 
 # ---- НАСТРОЙКИ ----
 BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # ФЬЮЧЕРСЫ!
-TTL_SECONDS = 1 * 30          # держим поток 30 секунд с момента последнего touch()
-AGG_INTERVAL_SEC = 1           # один бар в секунду по ЛОКАЛЬНОМУ таймеру
-QUEUE_MAXSIZE = 100000         # размер очереди тиков на символ
+TTL_SECONDS = Config.TTL_SECONDS          # держим поток 30 секунд с момента последнего touch()
+AGG_INTERVAL_SEC = Config.AGG_INTERVAL_SEC           # один бар в секунду по ЛОКАЛЬНОМУ таймеру
+QUEUE_MAXSIZE = 10000         # размер очереди тиков на символ
+#TICK_STREAM = "@aggTrade"
+TICK_STREAM = "@trade"
 
 def symbol_norm(sym: str) -> str:
     return sym.lower()
@@ -67,7 +70,7 @@ class StreamHub:
 
 # ---------- WS Reader ----------
 class WsReader(threading.Thread):
-    """Читает <symbol>@aggTrade c Binance Futures и пишет тики в hub."""
+    """Читает <symbol>{TICK_STREAM} c Binance Futures и пишет тики в hub."""
     def __init__(self, symbol: str, hub: StreamHub):
         super().__init__(daemon=True, name=f"WS-{symbol}")
         self.symbol = symbol
@@ -76,7 +79,7 @@ class WsReader(threading.Thread):
         self.wsapp: Optional[websocket.WebSocketApp] = None
 
     def run(self):
-        stream_name = f"{self.symbol}@aggTrade"
+        stream_name = f"{self.symbol}{TICK_STREAM}"
         url = f"{BINANCE_WS_URL}/{stream_name}"
 
         backoff = 1

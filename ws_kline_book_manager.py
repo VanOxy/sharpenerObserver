@@ -12,7 +12,7 @@ import zmq                    # pip install pyzmq
 # ===================== НАСТРОЙКИ =====================
 BINANCE_WS_BASE = "wss://fstream.binance.com"
 ZMQ_SUB_URL     = "tcp://127.0.0.1:5556"  # сюда ТГ-бот шлёт символы (btcusdt, ethusdt, ...)
-TTL_SECONDS     = 1* 60                 # 10 минут жизни «активного» символа после touch()
+TTL_SECONDS     = Config.TTL_SECONDS                 # 10 минут жизни «активного» символа после touch()
 RECONNECT_MAX_BACKOFF = 30
 
 # печатать отладку ридеров/подписок
