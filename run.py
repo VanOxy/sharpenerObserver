@@ -2,7 +2,6 @@
 """
 Главный файл для запуска интегрированной системы:
 - Telegram Observer для извлечения токенов из сообщений
-- ZMQ Publisher для отправки токенов в ws_ohlcv_manager
 - StreamManager для управления WebSocket потоками и создания OHLCV баров
 """
 
@@ -16,7 +15,6 @@ from ws_ohlcv_manager import StreamManager
 
 
 def extract_token_from_message(text):
-    """Извлекает токен из сообщения в формате `TOKENUSDT`"""
     if not text:
         return None
     match = re.search(r'`([A-Z0-9]+)`', text)
@@ -24,28 +22,14 @@ def extract_token_from_message(text):
 
 
 class TelegramStreamRunner:
-    """
-    Интегрированная система для:
-    1. Прослушивания Telegram канала
-    2. Извлечения токенов из сообщений
-    3. Отправки токенов в StreamManager через ZMQ
-    4. Управления WebSocket потоками для OHLCV данных
-    """
-    
     def __init__(self):
         Config.validate()
-        
-        # Telegram клиент
         self.client = TelegramClient(
             'observer_session',
             Config.API_ID,
             Config.API_HASH
         )
-        
-        # StreamManager для WebSocket потоков
         self.stream_manager = StreamManager()
-        
-        # Флаг остановки
         self.stop_event = threading.Event()
         
         print(f"🔧 Создан интегрированный наблюдатель для канала: {Config.CHANNEL_NAME}")
@@ -58,7 +42,7 @@ class TelegramStreamRunner:
             
             entity = await self.client.get_entity(channel_name)
             return entity
-            
+
         except Exception:
             # Если не нашли по username, ищем среди диалогов
             print(f"🔍 Ищем канал '{channel_name}' среди доступных каналов...")
@@ -109,14 +93,12 @@ class TelegramStreamRunner:
         return thread
 
     def send_token_to_stream_manager(self, token):
-        """Отправка токена напрямую в StreamManager"""
         try:
             self.stream_manager.touch(token)
         except Exception as e:
             print(f"❌ Ошибка отправки токена {token}: {e}")
 
     async def listen_for_messages(self):
-        """Основной метод для прослушивания Telegram сообщений"""
         try:
             print("🔌 Подключаемся к Telegram...")
             await self.client.start(phone=Config.PHONE_NUMBER)
