@@ -1,0 +1,4 @@
+telethon>=1.28.5
+python-dotenv>=1.0.0
+websocket-client>=1.6.0
+pyzmq>=25.0.0
