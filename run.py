@@ -10,7 +10,6 @@ import asyncio
 import re
 import threading
 import time
-import zmq
 from telethon import TelegramClient, events
 from config import Config
 from ws_ohlcv_manager import StreamManager
@@ -20,7 +19,7 @@ def extract_token_from_message(text):
     """Извлекает токен из сообщения в формате `TOKENUSDT`"""
     if not text:
         return None
-    match = re.search(r'`([A-Z][A-Z0-9]*USDT?)`', text)
+    match = re.search(r'`([A-Z0-9]+)`', text)
     return match.group(1).lower() if match else None
 
 
@@ -43,11 +42,6 @@ class TelegramStreamRunner:
             Config.API_HASH
         )
         
-        # ZMQ Publisher для отправки токенов в StreamManager
-        self.zmq_context = zmq.Context()
-        self.zmq_publisher = self.zmq_context.socket(zmq.PUB)
-        self.zmq_url = "tcp://127.0.0.1:5556"
-        
         # StreamManager для WebSocket потоков
         self.stream_manager = StreamManager()
         
@@ -55,7 +49,6 @@ class TelegramStreamRunner:
         self.stop_event = threading.Event()
         
         print(f"🔧 Создан интегрированный наблюдатель для канала: {Config.CHANNEL_NAME}")
-        print(f"📡 ZMQ Publisher будет отправлять токены на: {self.zmq_url}")
 
     async def find_channel(self, channel_name):
         """Поиск канала по имени"""
@@ -94,25 +87,6 @@ class TelegramStreamRunner:
             
             raise Exception(f"Канал '{channel_name}' не найден")
 
-    def start_zmq_publisher(self):
-        """Запуск ZMQ Publisher в отдельном потоке"""
-        def zmq_publisher_thread():
-            try:
-                self.zmq_publisher.bind(self.zmq_url)
-                print(f"📡 ZMQ Publisher запущен на {self.zmq_url}")
-                
-                # Держим сокет открытым
-                while not self.stop_event.is_set():
-                    time.sleep(0.1)
-                    
-            except Exception as e:
-                print(f"❌ Ошибка ZMQ Publisher: {e}")
-            finally:
-                self.zmq_publisher.close()
-        
-        thread = threading.Thread(target=zmq_publisher_thread, daemon=True, name="ZMQ-PUB")
-        thread.start()
-        return thread
 
     def start_stream_manager(self):
         """Запуск StreamManager в отдельном потоке"""
@@ -134,12 +108,10 @@ class TelegramStreamRunner:
         thread.start()
         return thread
 
-    def send_token_to_queue(self, token):
-        """Отправка токена в ZMQ очередь"""
+    def send_token_to_stream_manager(self, token):
+        """Отправка токена напрямую в StreamManager"""
         try:
-            message = f"symbol: {token}"
-            self.zmq_publisher.send_string(message)
-            print(f"📤 Отправлен токен в очередь: {token.upper()}")
+            self.stream_manager.touch(token)
         except Exception as e:
             print(f"❌ Ошибка отправки токена {token}: {e}")
 
@@ -153,9 +125,6 @@ class TelegramStreamRunner:
             # Ищем канал
             entity = await self.find_channel(Config.CHANNEL_NAME)
             print(f"✅ Найден канал: {entity.title}")
-            
-            # Запускаем ZMQ Publisher
-            zmq_thread = self.start_zmq_publisher()
             
             # Запускаем StreamManager
             stream_thread = self.start_stream_manager()
@@ -174,8 +143,8 @@ class TelegramStreamRunner:
                     token = extract_token_from_message(message.text)
                     if token:
                         print(f"🎯 Найден токен в сообщении: {token.upper()}")
-                        # Отправляем токен в очередь StreamManager
-                        self.send_token_to_queue(token)
+                        # Отправляем токен напрямую в StreamManager
+                        self.send_token_to_stream_manager(token)
                     else:
                         print(f"📝 Сообщение без токенов: {message.text[:100]}...")
             
@@ -196,17 +165,11 @@ class TelegramStreamRunner:
             except:
                 pass
             
-            try:
-                self.zmq_context.term()
-                print("📡 ZMQ Publisher остановлен")
-            except:
-                pass
             
             print("🏁 Все компоненты остановлены")
 
 
 async def main():
-    """Главная функция запуска"""
     runner = TelegramStreamRunner()
     await runner.listen_for_messages()
 

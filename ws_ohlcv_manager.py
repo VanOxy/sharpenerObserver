@@ -9,12 +9,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import websocket  # pip install websocket-client
-import zmq           # pip install pyzmq
 
 # ---- НАСТРОЙКИ ----
 BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # ФЬЮЧЕРСЫ!
-ZMQ_SUB_URL = "tcp://127.0.0.1:5556"  # сюда ТГ-бот шлёт символы (btcusdt, ethusdt, ...)
-TTL_SECONDS = 1 * 30          # держим поток 10 минут с момента последнего touch()
+TTL_SECONDS = 1 * 30          # держим поток 30 секунд с момента последнего touch()
 AGG_INTERVAL_SEC = 1           # один бар в секунду по ЛОКАЛЬНОМУ таймеру
 QUEUE_MAXSIZE = 100000         # размер очереди тиков на символ
 
@@ -165,7 +163,7 @@ class StreamManager:
       - на каждой итерации спим до ровной границы '…:01.000', '…:02.000', …
       - один бар на секунду, без дублей.
     """
-    def __init__(self, zmq_sub_url: str = ZMQ_SUB_URL):
+    def __init__(self):
         self.hub = StreamHub()
         self._states: Dict[str, SymState] = {}
         self._lock = threading.Lock()
@@ -175,10 +173,6 @@ class StreamManager:
                                         daemon=True, name="Aggregator")
         self._th_gc  = threading.Thread(target=self._gc_loop,
                                         daemon=True, name="GC")
-        
-        # ZMQ: слушаем уведомления из ТГ
-        self._zmq_sub_url = zmq_sub_url
-        self._th_zmq = threading.Thread(target=self._zmq_loop, daemon=True, name="ZMQ-SUB")
 
         # текущий "бакет" для накапливания тиков между распечатками: symbol -> [ticks]
         self._bucket: Dict[str, List[dict]] = defaultdict(list)
@@ -186,7 +180,6 @@ class StreamManager:
     def start(self):
         self._th_agg.start()
         self._th_gc.start()
-        self._th_zmq.start()
 
     def stop(self):
         self._stop.set()
@@ -195,13 +188,12 @@ class StreamManager:
                 st.reader.stop()
         self._th_agg.join(timeout=1)
         self._th_gc.join(timeout=1)
-        self._th_zmq.join(timeout=1)
 
     def touch(self, symbol: str):
-        """Вызов при уведомлении: создать/продлить поток на 10 минут."""
         symbol = symbol_norm(symbol)
         with self._lock:
             if symbol not in self._states:
+                print(f"🚀 Starting stream for {symbol.upper()}")
                 self.hub.ensure_symbol(symbol)
                 reader = WsReader(symbol, self.hub)
                 self._states[symbol] = SymState(
@@ -267,49 +259,8 @@ class StreamManager:
                         # подчистим текущий бакет
                         self._bucket.pop(sym, None)
             for sym in expired:
-                print(f"[GC] Stopped & removed {sym.upper()} (TTL expired)")
+                print(f"⏹️ Stopped {sym.upper()} (TTL expired)")
 
-    def _zmq_loop(self):
-        """
-        Простейший SUB: ждём строку с именем символа.
-        Форматы:
-          - "btcusdt"
-          - "symbol: ethusdt"
-          - "ETHUSDT any text ..."
-        Берём первое «слово», нормируем, делаем touch().
-        """
-        ctx = zmq.Context(io_threads=1)
-        sub = ctx.socket(zmq.SUB)
-        sub.setsockopt_string(zmq.SUBSCRIBE, "")
-        sub.connect(self._zmq_sub_url)
-        print(f"[ZMQ] SUB connected to {self._zmq_sub_url}")
-
-        while not self._stop.is_set():
-            try:
-                msg = sub.recv_string(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                time.sleep(0.01)
-                continue
-            except Exception as e:
-                print(f"[ZMQ] recv error: {e}")
-                time.sleep(0.5)
-                continue
-
-            # выдёргиваем 1-е «слово», отбрасываем префиксы вроде "symbol:"
-            parts = msg.strip().split()
-            if not parts:
-                continue
-            raw = parts[0]
-            if ":" in raw:
-                raw = raw.split(":", 1)[1]
-            sym = symbol_norm(raw)
-            if not sym:
-                continue
-            print(f"[ZMQ] Received symbol: {sym.upper()}")
-            self.touch(sym)
-
-        sub.close()
-        ctx.term()
 
 # ---------- Пример ----------
 if __name__ == "__main__":

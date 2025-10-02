@@ -64,8 +64,6 @@ python telegram_observer.py
 В файлах можно изменить:
 - `TTL_SECONDS` - время жизни WebSocket потока после последнего упоминания
 - `AGG_INTERVAL_SEC` - интервал создания OHLCV баров
-- `ZMQ_SUB_URL` - URL для ZMQ коммуникации между компонентами
-- `QUEUE_MAXSIZE` - размер очереди тиков
 
 ## Формат выходных данных
 
