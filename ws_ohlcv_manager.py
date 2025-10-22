@@ -4,28 +4,28 @@ import time
 import math
 import json
 import threading
+import websocket
 from queue import Queue, Empty
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import websocket  # pip install websocket-client
-
 # ---- НАСТРОЙКИ ----
 BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # ФЬЮЧЕРСЫ!
-TTL_SECONDS = Config.TTL_SECONDS          # держим поток 30 секунд с момента последнего touch()
-AGG_INTERVAL_SEC = Config.AGG_INTERVAL_SEC           # один бар в секунду по ЛОКАЛЬНОМУ таймеру
+TICK_STREAM = "@aggTrade"   #"@trade"
+TTL_SECONDS = Config.TTL_SECONDS   
+AGG_INTERVAL_SEC = Config.AGG_INTERVAL_SEC          
 QUEUE_MAXSIZE = 10000         # размер очереди тиков на символ
-#TICK_STREAM = "@aggTrade"
-TICK_STREAM = "@trade"
+
 
 def symbol_norm(sym: str) -> str:
     return sym.lower()
 
 # ---------- HUB: очереди тиков ----------
+# класс содержит очереди данных из стрима, локальный времменый хаб из которого аггрегируются фичи
 class StreamHub:
     def __init__(self, max_queue=QUEUE_MAXSIZE):
-        self._q: Dict[str, Queue] = {}
+        self._q: Dict[str, Queue] = {}  # очереди тиков
         self._lock = threading.Lock()
         self._max_queue = max_queue
 
@@ -49,9 +49,10 @@ class StreamHub:
         except Exception:
             # переполнение — дроп (или замени на q.put() для блокировки)
             pass
+    
 
     def drain_now(self) -> Dict[str, List[dict]]:
-        """Забрать всё, что есть в очередях, немедленно и неблокирующе."""
+        """Забрать всё, что есть в очередях тиков, немедленно и неблокирующе."""
         out: Dict[str, List[dict]] = {}
         for sym, q in list(self._q.items()):
             acc = []
@@ -63,6 +64,7 @@ class StreamHub:
             if acc:
                 out[sym] = acc
         return out
+    
 
     def drop_symbol(self, symbol: str):
         with self._lock:
@@ -70,7 +72,7 @@ class StreamHub:
 
 # ---------- WS Reader ----------
 class WsReader(threading.Thread):
-    """Читает <symbol>{TICK_STREAM} c Binance Futures и пишет тики в hub."""
+    """Читает <symbol>{TICK_STREAM} c Binance Futures и пишет данные в hub."""
     def __init__(self, symbol: str, hub: StreamHub):
         super().__init__(daemon=True, name=f"WS-{symbol}")
         self.symbol = symbol
@@ -79,6 +81,7 @@ class WsReader(threading.Thread):
         self.wsapp: Optional[websocket.WebSocketApp] = None
 
     def run(self):
+        # Поток тиков
         stream_name = f"{self.symbol}{TICK_STREAM}"
         url = f"{BINANCE_WS_URL}/{stream_name}"
 
@@ -221,14 +224,14 @@ class StreamManager:
         next_sec_label = int(math.ceil(time.time()))
 
         while not self._stop.is_set():
-            # 1) ждём РОВНОЭ секунду на «стене времени»
+            # 1) ждём РОВНО секунду на «стене времени»
             self._sleep_to_wall_second(next_sec_label)
 
             # 2) забираем накопившиеся тики к этому моменту в текущий бакет
             batch = self.hub.drain_now()
             for sym, ticks in batch.items():
                 self._bucket[sym].extend(ticks)
-
+            
             # 3) финализируем секунду (метка = next_sec_label), печать и очистка бакета
             rows = []
             for sym, ticks in list(self._bucket.items()):
@@ -272,7 +275,7 @@ if __name__ == "__main__":
 
     # имитируем «уведомления из ТГ»
     mgr.touch("btcusdt")
-    mgr.touch("ethusdt")
+    #mgr.touch("ethusdt")
 
     # через 15с обновим BTC (продлеваем ещё на 10 минут)
     def refresher():
@@ -286,8 +289,8 @@ if __name__ == "__main__":
         print("[TG] BNB notification")
         mgr.touch("bnbusdt")
 
-    threading.Thread(target=refresher, daemon=True).start()
-    threading.Thread(target=add_bnb, daemon=True).start()
+    #threading.Thread(target=refresher, daemon=True).start()
+    #threading.Thread(target=add_bnb, daemon=True).start()
 
     try:
         while True:

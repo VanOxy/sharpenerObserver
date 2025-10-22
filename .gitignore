@@ -2,3 +2,4 @@
 observer_session.session
 __pycache__
 venv
+.vscode/settings.json
