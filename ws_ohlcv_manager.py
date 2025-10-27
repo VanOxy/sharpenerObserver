@@ -15,7 +15,7 @@ BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # ФЬЮЧЕРСЫ!
 TICK_STREAM = "@aggTrade"   #"@trade"
 TTL_SECONDS = Config.TTL_SECONDS   
 AGG_INTERVAL_SEC = Config.AGG_INTERVAL_SEC          
-QUEUE_MAXSIZE = 10000         # размер очереди тиков на символ
+QUEUE_MAXSIZE = 2000         # размер очереди тиков на символ
 
 
 def symbol_norm(sym: str) -> str:
@@ -23,7 +23,7 @@ def symbol_norm(sym: str) -> str:
 
 # ---------- HUB: очереди тиков ----------
 # класс содержит очереди данных из стрима, локальный времменый хаб из которого аггрегируются фичи
-class StreamHub:
+class AggTradesStreamBuffer:
     def __init__(self, max_queue=QUEUE_MAXSIZE):
         self._q: Dict[str, Queue] = {}  # очереди тиков
         self._lock = threading.Lock()
@@ -33,11 +33,7 @@ class StreamHub:
         if symbol in self._q:
             return
         with self._lock:
-            if symbol not in self._q:
-                self._q[symbol] = Queue(maxsize=self._max_queue)
-
-    def has_symbol(self, symbol: str) -> bool:
-        return symbol in self._q
+            self._q[symbol] = Queue(maxsize=self._max_queue)
 
     def push(self, symbol: str, tick: dict):
         q = self._q.get(symbol)
@@ -47,6 +43,7 @@ class StreamHub:
         try:
             q.put_nowait(tick)
         except Exception:
+            print("переполнение — дроп")
             # переполнение — дроп (или замени на q.put() для блокировки)
             pass
     
@@ -71,9 +68,9 @@ class StreamHub:
             self._q.pop(symbol, None)
 
 # ---------- WS Reader ----------
-class WsReader(threading.Thread):
+class AggTradesWsReader(threading.Thread):
     """Читает <symbol>{TICK_STREAM} c Binance Futures и пишет данные в hub."""
-    def __init__(self, symbol: str, hub: StreamHub):
+    def __init__(self, symbol: str, hub: AggTradesStreamBuffer):
         super().__init__(daemon=True, name=f"WS-{symbol}")
         self.symbol = symbol
         self.hub = hub
@@ -156,10 +153,21 @@ def ohlcv_bucket(ticks: List[dict], t_sec: int) -> Optional[dict]:
         "n": len(ticks),
     }
 
+# ---------- Тип для отдачи наружу (батч API) ----------
+@dataclass(frozen=True)
+class Bar1s:
+    ts: int
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
+    n: int
+
 # ---------- Менеджер символов и TTL ----------
 @dataclass
 class SymState:
-    reader: WsReader
+    reader: AggTradesWsReader
     expires_at: float  # epoch seconds
 
 class StreamManager:
@@ -170,7 +178,7 @@ class StreamManager:
       - один бар на секунду, без дублей.
     """
     def __init__(self):
-        self.hub = StreamHub()
+        self.hub = AggTradesStreamBuffer()
         self._states: Dict[str, SymState] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -182,6 +190,10 @@ class StreamManager:
 
         # текущий "бакет" для накапливания тиков между распечатками: symbol -> [ticks]
         self._bucket: Dict[str, List[dict]] = defaultdict(list)
+
+        # кеш закрытых баров для батч-API
+        self._last_closed: Dict[str, Bar1s] = {}
+        self._lc_lock = threading.Lock()
 
     def start(self):
         self._th_agg.start()
@@ -201,7 +213,7 @@ class StreamManager:
             if symbol not in self._states:
                 print(f"🚀 Starting stream for {symbol.upper()}")
                 self.hub.ensure_symbol(symbol)
-                reader = WsReader(symbol, self.hub)
+                reader = AggTradesWsReader(symbol, self.hub)
                 self._states[symbol] = SymState(
                     reader=reader,
                     expires_at=time.time() + TTL_SECONDS
@@ -216,6 +228,24 @@ class StreamManager:
         delay = target_sec - time.time()
         if delay > 0:
             time.sleep(delay)
+
+    # --- helper для установки последнего закрытого бара ---
+    def _set_last_closed_bar(self, symbol: str, bar_dict: dict) -> None:
+        s = symbol_norm(symbol)
+        try:
+            bar = Bar1s(
+                ts=int(bar_dict["t"]),
+                o=float(bar_dict["o"]),
+                h=float(bar_dict["h"]),
+                l=float(bar_dict["l"]),
+                c=float(bar_dict["c"]),
+                v=float(bar_dict["v"]),
+                n=int(bar_dict["n"]),
+            )
+        except Exception:
+            return
+        with self._lc_lock:
+            self._last_closed[s] = bar
 
     def _aggregator_loop(self):
         step = AGG_INTERVAL_SEC
@@ -240,10 +270,11 @@ class StreamManager:
                 bar = ohlcv_bucket(ticks, t_sec=next_sec_label)
                 if bar:
                     rows.append((bar["t"], sym.upper(), bar))
+                    self._set_last_closed_bar(sym, bar) # обновить кеш последнего закрытого бара для батч-API
                 self._bucket[sym].clear()
 
             for _, sym, bar in sorted(rows, key=lambda r: (r[0], r[1])):
-                print(f"{sym} {time.strftime('%H:%M:%S', time.localtime(bar['t']))} "
+                print(f"AggTrades: {sym} {time.strftime('%H:%M:%S', time.localtime(bar['t']))} "
                       f"O:{bar['o']} H:{bar['h']} L:{bar['l']} C:{bar['c']} V:{bar['v']} N:{bar['n']}")
 
             # 4) следующая ровная секунда
@@ -261,12 +292,18 @@ class StreamManager:
                         st.reader.stop()
                         expired.append(sym)
                         self.hub.drop_symbol(sym)
+                        del self._last_closed[sym]
                         del self._states[sym]
                         # подчистим текущий бакет
                         self._bucket.pop(sym, None)
             for sym in expired:
                 print(f"⏹️ Stopped {sym.upper()} (TTL expired)")
 
+    # ---- публичный геттер для батч-API -----
+    def get_all_last_bars(self) -> Dict[str, Optional[Bar1s]]:
+        with self._lc_lock:
+            keys = list(self._last_closed.keys())
+            return {k: self._last_closed.get(k) for k in keys}
 
 # ---------- Пример ----------
 if __name__ == "__main__":
