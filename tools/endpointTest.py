@@ -4,8 +4,8 @@ import websockets
 
 #URL = sys.argv[1] if len(sys.argv) > 1 else "wss://fstream.binance.com/ws/btcusdt@kline_1m"
 # URL = "wss://fstream.binance.com/ws/btcusdt_perpetual@continuousKline_1s"
-#URL = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
-URL = "wss://fstream.binance.com/ws/ethusdt@depth@100ms"
+URL = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
+#URL = "wss://fstream.binance.com/ws/ethusdt@depth@100ms"
 stop_event = asyncio.Event()
 
 def _handle_signal(*_):
