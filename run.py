@@ -1,6 +1,3 @@
-# =============================
-# file: run.py
-# =============================
 from orchestrator import Orchestrator
 
 def main():
