@@ -321,9 +321,7 @@ class DepthBooksManager:
         self._session = requests.Session()
         self._stop = threading.Event()
         self._auto_evict_sec = int(auto_evict_sec)
-
         self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True, name="DepthGC")
-        self._gc_thread.start()
 
     # ---------------- Lifecycle ----------------
     def touch(self, symbol: str) -> None:
@@ -339,6 +337,9 @@ class DepthBooksManager:
             worker = _SymbolDepthWorker(sym_l, book, session=self._session)
             self._states[sym_l] = _SymState(book=book, worker=worker, last_access_ts=now)
             worker.start()
+
+    def start(self):
+        self._gc_thread.start()
 
     def stop(self, symbol: Optional[str] = None) -> None:
         with self._lock:

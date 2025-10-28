@@ -1,3 +1,7 @@
+# =============================
+# file: config.py
+# =============================
+
 import os
 from dotenv import load_dotenv
 
@@ -6,14 +10,14 @@ load_dotenv()
 class Config:
     API_ID = os.getenv('TELEGRAM_API_ID')
     API_HASH = os.getenv('TELEGRAM_API_HASH')
-    PHONE_NUMBER = os.getenv('TELEGRAM_PHONE')
+    TELEGRAM_PHONE = os.getenv('TELEGRAM_PHONE')
     CHANNEL_NAME = os.getenv('CHANNEL_NAME')
     TTL_SECONDS = float(os.getenv('TTL_SECONDS'))
     AGG_INTERVAL_SEC = float(os.getenv('AGG_INTERVAL_SEC'))
     
     @classmethod
     def validate(cls):
-        required_fields = ['API_ID', 'API_HASH', 'PHONE_NUMBER', 'CHANNEL_NAME', 'TTL_SECONDS', 'AGG_INTERVAL_SEC']
+        required_fields = ['API_ID', 'API_HASH', 'TELEGRAM_PHONE', 'CHANNEL_NAME', 'TTL_SECONDS', 'AGG_INTERVAL_SEC']
         missing_fields = []
         
         for field in required_fields:

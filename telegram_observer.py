@@ -1,109 +1,107 @@
-#!/usr/bin/env python3
-
+# =============================
+# file: telegram_observer.py
+# =============================
+import threading
 import asyncio
 import re
+from typing import Callable, Optional
+
 from telethon import TelegramClient, events
 from config import Config
 
-def extract_token_from_message(text):
+
+def extract_token_from_TGmessage(text: Optional[str]) -> Optional[str]:
     if not text:
-        return ''
-    match = re.search(r'`([A-Z][A-Z0-9]*)`', text)
-    return match.group(1) if match else None
+        return None
+    m = re.search(r'`([A-Z][A-Z0-9]*)`', text)
+    token = m.group(1) if m else None
+    return token
+
 
 class TelegramObserver:
-    
-    def __init__(self):
+    """
+    Вызывает on_token(symbol) на каждом подходящем сообщении.
+    """
+    def __init__(self) -> None:
         Config.validate()
-        
-        self.client = TelegramClient(
-            'observer_session',
-            Config.API_ID,
-            Config.API_HASH
-        )
-        
-        print(f"🔧 Создан наблюдатель для канала: {Config.CHANNEL_NAME}")
-    
-    async def find_channel(self, channel_name):
+
+        self._api_id = Config.API_ID
+        self._api_hash = Config.API_HASH
+        self._channel = Config.CHANNEL_NAME
+        self._phone = Config.TELEGRAM_PHONE
+        self._session = "tg_session"
+        self._target_chat = None
+
+        self._client: Optional[TelegramClient] = None
+        self._on_token: Optional[Callable[[str], None]] = None
+
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # === lifecycle ===
+    def start(self, on_token: Callable[[str], None]) -> None:
+        self._on_token = on_token
+        self._thread = threading.Thread(target=self._thread_main, name="TGTelethon", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    # === thread & async loop ===
+    def _thread_main(self) -> None:
         try:
-            if not channel_name.startswith('@'):
-                channel_name = '@' + channel_name.replace(' ', '_').lower()
-            
-            entity = await self.client.get_entity(channel_name)
-            return entity
-            
+            asyncio.run(self._async_main())
+        except Exception as e:
+            print(f"[TG] telethon loop error: {e}")
+
+    async def _resolve_channel(self, client: TelegramClient):
+        """Резолвим канал один раз и возвращаем его chat_id (или None)."""
+        if not self._channel:
+            return None
+        target = self._channel.strip()
+        uname = target.lstrip('@').replace(' ', '_').lower()
+
+        try:
+            entity = await client.get_entity('@' + uname)
+            if entity:
+                print(f"[TG] target resolved by username: @{uname})")
+                return entity
         except Exception:
-            # Если не нашли по username, ищем среди диалогов
-            print(f"🔍 Ищем канал '{channel_name}' среди доступных каналов...")
-            
-            async for dialog in self.client.iter_dialogs():
-                if hasattr(dialog.entity, 'title'):
-                    title = dialog.entity.title.lower()
-                    search_name = channel_name.replace('@', '').lower()
-                    
-                    if search_name in title or title in search_name:
-                        print(f"✅ Найден канал: '{dialog.entity.title}' (ID: {dialog.entity.id})")
-                        return dialog.entity
-            
-            # Если все еще не нашли, выводим список доступных каналов
-            print("\n📋 Доступные каналы и группы:")
-            print("-" * 50)
-            
-            async for dialog in self.client.iter_dialogs():
-                if hasattr(dialog.entity, 'title'):
-                    entity_type = "Канал" if hasattr(dialog.entity, 'broadcast') and dialog.entity.broadcast else "Группа"
-                    print(f"{entity_type}: {dialog.entity.title}")
-                    if hasattr(dialog.entity, 'username') and dialog.entity.username:
-                        print(f"  Username: @{dialog.entity.username}")
-                    print(f"  ID: {dialog.entity.id}")
-                    print()
-            
-            raise Exception(f"Канал '{channel_name}' не найден")
-    
-    async def listen_for_messages(self):
-        try:
-            print("🔌 Подключаемся к Telegram...")
-            await self.client.start(phone=Config.PHONE_NUMBER)
-            print("✅ Подключение успешно!")
-            
-            # Ищем канал
-            entity = await self.find_channel(Config.CHANNEL_NAME)
-            print(f"✅ Найден канал: {entity.title}")
-            
-            # Сохраняем entity для использования в обработчике
-            self.target_entity = entity
-            
-            print("👂 Слушаем новые сообщения... (Ctrl+C для остановки)")
-            print("=" * 50)
-            
-            # Обработчик новых сообщений
-            @self.client.on(events.NewMessage(chats=entity))
-            async def handle_new_message(event):
+            pass
+
+    async def _async_main(self) -> None:
+        client = TelegramClient(self._session, self._api_id, self._api_hash)
+        self._client = client
+
+        print("[TG] connecting…")
+        await client.start(phone=self._phone)
+
+        print("[TG] connected. Resolving channel…")
+        self._target_chat = await self._resolve_channel(client)
+        if self._target_chat:
+            print(f"[TG] will filter by chat={self._target_chat.username}")
+        else:
+            print("No channel with a such name found")
+            return
+        
+        print("[TG] Listening … (Ctrl+C to stop)")
+        @client.on(events.NewMessage(chats=self._target_chat))
+        async def handler(event):
+            try:
                 message = event.message
                 if message.text:
-                    token = extract_token_from_message(message.text)
-                    if token:
-                        print(token)
-                    else:
-                        print("Токены не найдены")
-            
-            # Запускаем прослушивание
-            await self.client.run_until_disconnected()
-            
-        except KeyboardInterrupt:
-            print("\n⏹️ Остановка мониторинга...")
-        except Exception as e:
-            print(f"❌ Ошибка: {e}")
+                    token = extract_token_from_TGmessage(message.text)
+                    if token and self._on_token:
+                        print(f"[TG message] -> {token}")
+                        self._on_token(token)
+            except Exception as e:
+                print(f"[TG] handler error: {e}")
+
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(0.5)
         finally:
-            await self.client.disconnect()
-            print("🔌 Отключились от Telegram")
-
-async def main():
-    observer = TelegramObserver()
-    await observer.listen_for_messages()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Выход...")
+            await client.disconnect()
+            print("[TG] disconnected")

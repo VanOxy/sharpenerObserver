@@ -273,9 +273,10 @@ class StreamManager:
                     self._set_last_closed_bar(sym, bar) # обновить кеш последнего закрытого бара для батч-API
                 self._bucket[sym].clear()
 
-            for _, sym, bar in sorted(rows, key=lambda r: (r[0], r[1])):
-                print(f"AggTrades: {sym} {time.strftime('%H:%M:%S', time.localtime(bar['t']))} "
-                      f"O:{bar['o']} H:{bar['h']} L:{bar['l']} C:{bar['c']} V:{bar['v']} N:{bar['n']}")
+            # FOR DEBUG
+            # for _, sym, bar in sorted(rows, key=lambda r: (r[0], r[1])):
+            #     print(f"AggTrades: {sym} {time.strftime('%H:%M:%S', time.localtime(bar['t']))} "
+            #           f"O:{bar['o']} H:{bar['h']} L:{bar['l']} C:{bar['c']} V:{bar['v']} N:{bar['n']}")
 
             # 4) следующая ровная секунда
             now = time.time()
