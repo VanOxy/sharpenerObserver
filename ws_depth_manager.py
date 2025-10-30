@@ -77,11 +77,37 @@ class LocalOrderBook:
             self._last_update_id = u
 
     # ---------------- Queries ----------------
-    def get_top_n(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    def get_top_L(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """Топ-L уровней: bids по убыванию цены, asks по возрастанию."""
         with self._lock:
             bids_sorted = sorted(self._bids.items(), key=lambda x: x[0], reverse=True)[:n]
             asks_sorted = sorted(self._asks.items(), key=lambda x: x[0])[:n]
             return bids_sorted, asks_sorted
+        
+    def get_dom_snapshot(self, L: int = 20) -> Dict[str, object]:
+        """DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно."""
+        bids, asks = self.get_top_L(L)
+        best_bid = bids[0][0] if bids else 0.0
+        best_ask = asks[0][0] if asks else 0.0
+        mid = (best_bid + best_ask) / 2.0 if (best_bid and best_ask) else 0.0
+        spread = (best_ask - best_bid) if (best_bid and best_ask) else 0.0
+
+        def pack(levels):
+            # вернём и относительную цену к mid — удобно для нормализации
+            out = []
+            for px, qty in levels:
+                usd = px * qty
+                rel = ((px - mid) / mid) if mid > 0 else 0.0
+                out.append({"px": px, "qty": qty, "usd": usd, "rel": rel})
+            return out
+
+        return {
+            "symbol": self.symbol,
+            "mid": mid,
+            "spread": spread,
+            "bids": pack(bids),   # длина ≤ L
+            "asks": pack(asks),   # длина ≤ L
+        }
 
     # ======= Метрики в USDT (quote) =======
     @staticmethod
@@ -128,7 +154,7 @@ class LocalOrderBook:
         return num / den
 
     def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
-        bids, asks = self.get_top_n(n)
+        bids, asks = self.get_top_L(n)
 
         sum_bid_usd, used_bids = self._sum_top_n_usd(bids, n)
         sum_ask_usd, used_asks = self._sum_top_n_usd(asks, n)
@@ -308,13 +334,7 @@ class _SymState:
 
 
 class DepthBooksManager:
-    """
-    - touch(symbol)            -> создать/продлить TTL
-    - get_depth(symbol, n)     -> чтение без продления TTL
-    - get_features(symbol, …)  -> чтение без продления TTL
-    - get_all_features(…)      -> батч без продления TTL
-    - авто-эвикшн по неактивности
-    """
+    """ авто-эвикшн по неактивности """
     def __init__(self, auto_evict_sec: int = AUTO_EVICT_SEC):
         self._states: Dict[str, _SymState] = {}
         self._lock = threading.RLock()
@@ -334,6 +354,7 @@ class DepthBooksManager:
                 st.last_access_ts = now  # TTL продлеваем ТОЛЬКО здесь
                 return
             book = LocalOrderBook(sym_u)
+            print(f"🚀 Starting Depth stream for {sym_u}")
             worker = _SymbolDepthWorker(sym_l, book, session=self._session)
             self._states[sym_l] = _SymState(book=book, worker=worker, last_access_ts=now)
             worker.start()
@@ -354,38 +375,6 @@ class DepthBooksManager:
             if st:
                 st.worker.stop()
 
-    # ---------------- Queries (без продления TTL) ----------------
-    def list_symbols(self) -> List[str]:
-        with self._lock:
-            return list(self._states.keys())
-
-    def get_depth(self, symbol: str, n: int = 20) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        sym_l = symbol.lower()
-        with self._lock:
-            st = self._states.get(sym_l)
-            if not st:
-                return [], []
-            return st.book.get_top_n(n)
-
-    def get_features(self, symbol: str, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
-        sym_l = symbol.lower()
-        with self._lock:
-            st = self._states.get(sym_l)
-            if not st:
-                return {}
-            return st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
-
-    def get_all_features(self, n: int = 100, impact_usdt: float = 10_000, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
-        out: Dict[str, Dict[str, float]] = {}
-        with self._lock:
-            keys = [s.lower() for s in (symbols or self._states.keys())]
-            for sym in keys:
-                st = self._states.get(sym)
-                if not st:
-                    continue
-                out[sym.upper()] = st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
-        return out
-
     # ---------------- GC / авто-эвикшн ----------------
     def _gc_loop(self):
         while not self._stop.is_set():
@@ -405,6 +394,50 @@ class DepthBooksManager:
                         del self._states[sym]
             for sym in expired:
                 print(f"⏹️ Depth GC: stopped {sym.upper()} (idle > {self._auto_evict_sec}s)")
+
+    # ---------------- Queries (без продления TTL) ----------------
+    def list_symbols(self) -> List[str]:
+        with self._lock:
+            return list(self._states.keys())
+
+    def get_dom_snapshot(self, symbol: str, L: int = 20) -> Dict[str, object]:
+        sym_l = symbol.lower()
+        with self._lock:
+            st = self._states.get(sym_l)
+            if not st:
+                return {}
+            return st.book.get_dom_snapshot(L=L)
+
+    def get_all_dom(self, L: int = 20, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, object]]:
+        out: Dict[str, Dict[str, object]] = {}
+        with self._lock:
+            keys = [s.lower() for s in (symbols or self._states.keys())]
+            for sym in keys:
+                st = self._states.get(sym)
+                if not st:
+                    continue
+                out[sym.lower()] = st.book.get_dom_snapshot(L=L)
+        return out
+
+    def get_features(self, symbol: str, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
+        sym_l = symbol.lower()
+        with self._lock:
+            st = self._states.get(sym_l)
+            if not st:
+                return {}
+            return st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
+
+    def get_all_features(self, n: int = 100, impact_usdt: float = 10_000, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
+        out: Dict[str, Dict[str, float]] = {}
+        with self._lock:
+            keys = [s.lower() for s in (symbols or self._states.keys())]
+            for sym in keys:
+                st = self._states.get(sym)
+                if not st:
+                    continue
+                out[sym.lower()] = st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
+        return out
+    
 
 
 # --------------------------- Minimal self-test ---------------------------
@@ -439,15 +472,16 @@ if __name__ == "__main__":
         print("✅Started depth workers for port3. Gathering data for ~2s...")
 
 
-    threading.Thread(target=bnb, daemon=True).start()
-    threading.Thread(target=eth, daemon=True).start()
-    threading.Thread(target=AVAAIUSDT, daemon=True).start()
-    threading.Thread(target=REZUSDT, daemon=True).start()
-    threading.Thread(target=PORT3USDT, daemon=True).start()
+    # threading.Thread(target=bnb, daemon=True).start()
+    # threading.Thread(target=eth, daemon=True).start()
+    # threading.Thread(target=AVAAIUSDT, daemon=True).start()
+    # threading.Thread(target=REZUSDT, daemon=True).start()
+    # threading.Thread(target=PORT3USDT, daemon=True).start()
 
     try:
         while True:
-            batch = mgr.get_all_features(n=1000, impact_usdt=10_000)
+            #batch = mgr.get_all_features(n=1000, impact_usdt=10_000)
+            batch = mgr.get_all_dom()
             print(batch)
             time.sleep(1)
             

@@ -211,7 +211,7 @@ class StreamManager:
         symbol = symbol_norm(symbol)
         with self._lock:
             if symbol not in self._states:
-                print(f"🚀 Starting stream for {symbol.upper()}")
+                print(f"🚀 Starting AggTrades stream for {symbol.upper()}")
                 self.hub.ensure_symbol(symbol)
                 reader = AggTradesWsReader(symbol, self.hub)
                 self._states[symbol] = SymState(
