@@ -1,11 +1,12 @@
 import threading
 import time
-from typing import Set
+import math
 
-from config import Config
 from telegram_observer import TelegramObserver
 from ws_ohlcv_manager import StreamManager as AggTrades
 from ws_depth_manager import DepthBooksManager
+from ws_depth_sampler import DepthSampler
+from snapshot_packer import SnapshotPacker
 from action_codec import ActionCodec
 from paper_broker import PaperBroker
 
@@ -13,6 +14,8 @@ from paper_broker import PaperBroker
 def symbol_norm(s: str) -> str:
     return s.strip().lower()
 
+def _ts_ms() -> int:
+    return int(time.time() * 1000)
 
 class Orchestrator:
     """
@@ -27,8 +30,12 @@ class Orchestrator:
         self._ohlcv = AggTrades()
         self._depth = DepthBooksManager()
 
-        #init trading services
+        #init features services
         self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)
+        self.sampler = DepthSampler(top_n=40, tail_bins=32, tail_max_bps=50.0)
+        self.packer  = SnapshotPacker(self.sampler, extra_keys=["sum_bid_n_usd","sum_ask_n_usd"])
+
+        #init trading services
         self.broker = PaperBroker(csv_path="trades.csv", taker_fee_rate=0.0004)
 
         #threads management
@@ -60,7 +67,7 @@ class Orchestrator:
         # выравниваемся на следующую целую секунду
         next_tick = int(time.time()) + 1  
 
-        self.on_token("btcusdt")                                          # debug
+        self.on_token("btcusdt")                     # debug
 
         while not self._stop.is_set():
             # ждем до границы секунды + дельта
@@ -74,17 +81,26 @@ class Orchestrator:
             try:
                 # get data
                 bars = self._ohlcv.get_all_last_bars() 
-                dom_all = self._depth.get_all_dom(L=40)           # пока L=40; позже расширим sampler'ом
+                dom_all = self._depth.get_all_dom(L=50)           # пока L=40; позже расширим sampler'ом
                 feats = self._depth.get_all_features()
 
+                payload = self.packer.pack(
+                    bars=bars,
+                    dom_all=dom_all,
+                    feats=feats,
+                    S_cap=64,                        # та же планка, что и у ActionCodec
+                    symbols_order_hint=None          # можно передать твой порядок, если нужен
+                )
+
+
                 # выберем список активных символов (есть валидный DOM+bar)
-                symbols = []
-                for s in sorted(set(dom_all.keys()) & set(bars.keys()) & set(feats.keys())):
-                    if dom_all[s].get("mid", 0.0) > 0 and bars[s].o > 0 and feats[s].get("sum_bid_n_usd") > 0:
-                        symbols.append(s)
+                symbols = payload["symbols"]
+                print("symbols: ", symbols)
+                #print("payload: ", payload)
                 if not symbols:
                     continue
-                print("symbols: ", symbols)
+
+
 
                 # ACTION
                 # здесь у вас будет вызов модели → получите дискретное действие `a`

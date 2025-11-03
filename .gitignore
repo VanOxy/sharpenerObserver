@@ -1,6 +1,6 @@
-.env
-observer_session.session
+.vscode/settings.json
 __pycache__
 venv
-.vscode/settings.json
+.env
 tg_session.session
+trades.csv
