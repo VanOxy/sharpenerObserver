@@ -51,6 +51,13 @@ class Orchestrator:
         time.sleep(2)
         self._thread.start()
 
+        # агрессивно урезаем numpy-печать (на всякий)
+        try:
+            import numpy as np
+            np.set_printoptions(edgeitems=2, threshold=16, suppress=True)
+        except Exception:
+            pass
+
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2)
@@ -64,25 +71,41 @@ class Orchestrator:
 
     # === 1Hz wall-clock loop ===
     def _run_loop(self) -> None:
-        # выравниваемся на следующую целую секунду
-        next_tick = int(time.time()) + 1  
+        # === планируем по monotonic, выравниваем на ближайшую "целую" секунду ===
+        mono = time.monotonic
+        perf = time.perf_counter
+        poll_s = self._poll_delay_ms / 1000.0
+        # выравниваемся
+        next_tick = math.floor(mono()) + 1
 
         self.on_token("btcusdt")                     # debug
 
+        # вспомогательный профайлер
+        def lap(t0, tag):
+            t1 = perf()
+            dt = (t1 - t0) * 1000.0
+            return t1, dt, tag
+        
+        iter_idx = 0
+
         while not self._stop.is_set():
-            # ждем до границы секунды + дельта
-            now = time.time()  
-            sleep_s = (next_tick - now) + (self._poll_delay_ms / 1000.0)
+            # подождать до границы + дельта
+            sleep_s = (next_tick + poll_s) - mono()
             print("sleep_s: ", sleep_s)
             if sleep_s > 0:
                 self._stop.wait(timeout=sleep_s)
+
+            t0 = perf()
 
             # job
             try:
                 # get data
                 bars = self._ohlcv.get_all_last_bars() 
+                t0, dt_bars, _ = lap(t0, "bars")
                 dom_all = self._depth.get_all_dom(L=50)           # пока L=40; позже расширим sampler'ом
+                t0, dt_dom, _  = lap(t0, "dom")
                 feats = self._depth.get_all_features()
+                t0, dt_feats, _ = lap(t0, "feats")
 
                 payload = self.packer.pack(
                     bars=bars,
@@ -91,25 +114,38 @@ class Orchestrator:
                     S_cap=64,                        # та же планка, что и у ActionCodec
                     symbols_order_hint=None          # можно передать твой порядок, если нужен
                 )
-
+                t0, dt_pack, _ = lap(t0, "pack")
 
                 # выберем список активных символов (есть валидный DOM+bar)
                 symbols = payload["symbols"]
                 print("symbols: ", symbols)
-                #print("payload: ", payload)
+
+                # --- компактный лог раз в N итераций ---
+                if iter_idx % 5 == 0:
+                    S = len(symbols)
+                    bars_shape = payload["bars"].shape
+                    top_n = payload["depth_top_px"].shape[-1]
+                    tail_bins = payload["depth_tail_qty"].shape[-1]
+                    print(f"[tick] S={S} bars{bars_shape} top_n={top_n} tail_bins={tail_bins} "
+                          f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
+                    if S:
+                        print(f"symbols: {symbols[:min(6,S)]}{'...' if S>6 else ''}")
+                # НЕ печатать payload целиком!
+
                 if not symbols:
                     continue
-
 
 
                 # ACTION
                 # здесь у вас будет вызов модели → получите дискретное действие `a`
                 a = 0  # заглушка: HOLD
                 kind, sym_idx, payload = self.codec.decode(a)
-                print("codec: ")
-                print("kind: ", kind, "sym_idx: ", sym_idx, "payload :", payload)
+                if iter_idx % 10 == 0:
+                    print(f"codec: kind={kind} sym_idx={sym_idx} payload={payload}")
+                #print("codec: ")
+                #print("kind: ", kind, "sym_idx: ", sym_idx, "payload :", payload)
 
-                if kind == "trade":
+                if kind == "trade" and 0 <= sym_idx < len(symbols):
                     if sym_idx >= len(symbols):
                         pass  # действие в паддинг — игнор
                     else:
@@ -126,6 +162,13 @@ class Orchestrator:
 
             finally:
                 next_tick += 1
-                while next_tick <= time.time():
-                    print("second missing")
-                    next_tick += 1
+                lag = mono() - next_tick
+                if lag >= 0:
+                    # мы позади: наверстаем, но не спамим логом
+                    miss = 0
+                    while next_tick <= mono():
+                        next_tick += 1
+                        miss += 1
+                    if miss > 0:
+                        print(f"second missing x{miss} (lag {lag:.3f}s)")
+                iter_idx += 1
