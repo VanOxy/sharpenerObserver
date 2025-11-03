@@ -118,19 +118,14 @@ class Orchestrator:
 
                 # выберем список активных символов (есть валидный DOM+bar)
                 symbols = payload["symbols"]
-                print("symbols: ", symbols)
 
                 # --- компактный лог раз в N итераций ---
                 if iter_idx % 5 == 0:
+                    print("symbols: ", symbols)
                     S = len(symbols)
-                    bars_shape = payload["bars"].shape
-                    top_n = payload["depth_top_px"].shape[-1]
-                    tail_bins = payload["depth_tail_qty"].shape[-1]
-                    print(f"[tick] S={S} bars{bars_shape} top_n={top_n} tail_bins={tail_bins} "
-                          f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
+                    print(f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
                     if S:
                         print(f"symbols: {symbols[:min(6,S)]}{'...' if S>6 else ''}")
-                # НЕ печатать payload целиком!
 
                 if not symbols:
                     continue
@@ -140,8 +135,8 @@ class Orchestrator:
                 # здесь у вас будет вызов модели → получите дискретное действие `a`
                 a = 0  # заглушка: HOLD
                 kind, sym_idx, payload = self.codec.decode(a)
-                if iter_idx % 10 == 0:
-                    print(f"codec: kind={kind} sym_idx={sym_idx} payload={payload}")
+                #if iter_idx % 10 == 0:
+                    #print(f"codec: kind={kind} sym_idx={sym_idx} payload={payload}")
                 #print("codec: ")
                 #print("kind: ", kind, "sym_idx: ", sym_idx, "payload :", payload)
 
