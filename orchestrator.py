@@ -122,10 +122,7 @@ class Orchestrator:
                 # --- компактный лог раз в N итераций ---
                 if iter_idx % 5 == 0:
                     print("symbols: ", symbols)
-                    S = len(symbols)
                     print(f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
-                    if S:
-                        print(f"symbols: {symbols[:min(6,S)]}{'...' if S>6 else ''}")
 
                 if not symbols:
                     continue
