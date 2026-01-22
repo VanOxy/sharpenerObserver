@@ -101,3 +101,24 @@ class PaperBroker:
                 f"{p.qty:.8f}", f"{p.avg_px:.2f}", f"{self.cash:.2f}", f"{self.realized_pnl:.2f}"
             ])
         return True
+    
+    def get_total_pnl(self, current_prices: Dict[str, float]) -> float:
+        """
+        Вычисляет общий PnL (реализованный + нереализованный).
+        current_prices: dict {symbol: current_mid_price}
+        """
+        unrealized = 0.0
+        for symbol, pos in self.pos.items():
+            if pos.qty != 0.0 and symbol in current_prices:
+                current_price = current_prices[symbol]
+                # Нереализованный PnL
+                if pos.qty > 0:  # long
+                    unrealized += (current_price - pos.avg_px) * pos.qty
+                else:  # short
+                    unrealized += (pos.avg_px - current_price) * abs(pos.qty)
+        
+        return self.realized_pnl + unrealized
+    
+    def get_positions(self) -> Dict[str, float]:
+        """Возвращает текущие позиции: {symbol: qty}."""
+        return {sym: pos.qty for sym, pos in self.pos.items() if abs(pos.qty) > 1e-8}
