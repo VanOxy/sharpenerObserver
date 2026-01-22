@@ -2,6 +2,12 @@
 from typing import Dict, List, Optional, Tuple
 import math
 import numpy as np
+from time import perf_counter
+
+def _lap(t0, tag, tb):
+    t1 = perf_counter()
+    tb[tag] = tb.get(tag, 0.0) + (t1 - t0) * 1000.0
+    return t1
 
 class DepthSampler:
     """
@@ -57,8 +63,7 @@ class DepthSampler:
         return px, qty
 
     def _tail_bins_qty(
-        self, side_levels: List[Dict], start_idx: int, mid: float, sign: int
-    ) -> np.ndarray:
+        self, side_levels: List[Dict], start_idx: int, mid: float) -> np.ndarray:
         """
         Агрегирует qty в tail_bins по |rel| в bps от mid.
         sign: -1 для bid, +1 для ask (для вычисления rel берём модуль, знак не важен).
@@ -73,7 +78,6 @@ class DepthSampler:
             qty = float(lv.get("qty", 0.0))
             if qty <= 0 or mid <= 0 or px <= 0:
                 continue
-
             rel = self._ensure_level_rel(px, mid, lv)  # ~ (px-mid)/mid
             rel_bps = abs(rel) * 1e4  # → bps
             if rel_bps <= 0:
@@ -112,10 +116,15 @@ class DepthSampler:
             dtype=self.dtype
         )
 
-    def compress(self, dom_sym: Dict) -> Optional[Dict]:
-        """Возвращает словарь с массивами и фичами или None, если DOM невалиден."""
+    def compress(self, dom_sym: Dict, tb: Optional[Dict[str, float]] = None) -> Optional[Dict]:
+        """Возвращает словарь с массивами и фичами или None, если DOM невалиден.
+            Если передан tb — аккумулируем туда время по этапам.
+        """
         if not dom_sym:
             return None
+        #debug
+        t = perf_counter() if tb is not None else None
+
         mid = float(dom_sym.get("mid", 0.0))
         bids = dom_sym.get("bids") or []
         asks = dom_sym.get("asks") or []
@@ -123,12 +132,17 @@ class DepthSampler:
             return None
 
         # Top-N
+        if tb is not None: t = _lap(t, "ds_pre_top", tb)
         bid_px, bid_qty = self._top_arrays(bids, self.top_n, descending=True)
+        if tb is not None: t = _lap(t, "ds_top_bids", tb)
         ask_px, ask_qty = self._top_arrays(asks, self.top_n, descending=False)
+        if tb is not None: t = _lap(t, "ds_top_asks", tb)
 
         # Хвосты
-        tail_bid = self._tail_bins_qty(bids, self.top_n, mid, sign=-1)
-        tail_ask = self._tail_bins_qty(asks, self.top_n, mid, sign=+1)
+        tail_bid = self._tail_bins_qty(bids, self.top_n, mid)
+        if tb is not None: t = _lap(t, "ds_tail_bids", tb)
+        tail_ask = self._tail_bins_qty(asks, self.top_n, mid)
+        if tb is not None: t = _lap(t, "ds_tail_asks", tb)
 
         # Фичи (imbalance по первым k уровням)
         k = min(self.imb_k, self.top_n)
@@ -138,10 +152,10 @@ class DepthSampler:
         best_ask_px = float(ask_px[0]) if ask_px.size > 0 else 0.0
         best_bid_qty = float(bid_qty[0]) if bid_qty.size > 0 else 0.0
         best_ask_qty = float(ask_qty[0]) if ask_qty.size > 0 else 0.0
-
         feats = self._fast_feats(
             mid, best_bid_px, best_bid_qty, best_ask_px, best_ask_qty, bid_qty_k, ask_qty_k
         )
+        if tb is not None: _lap(t, "ds_feats", tb)
 
         return {
             "top_bid_px": bid_px,

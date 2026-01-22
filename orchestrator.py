@@ -1,3 +1,6 @@
+# =============================
+# file: orchestrator.py
+# =============================
 import threading
 import time
 import math
@@ -34,6 +37,9 @@ class Orchestrator:
         self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)
         self.sampler = DepthSampler(top_n=40, tail_bins=32, tail_max_bps=50.0)
         self.packer  = SnapshotPacker(self.sampler, extra_keys=["sum_bid_n_usd","sum_ask_n_usd"])
+
+        # новый: единовременная аллокация матриц
+        self.packer.alloc_workspace(S_cap=64)
 
         #init trading services
         self.broker = PaperBroker(csv_path="trades.csv", taker_fee_rate=0.0004)
@@ -78,7 +84,7 @@ class Orchestrator:
         # выравниваемся
         next_tick = math.floor(mono()) + 1
 
-        self.on_token("btcusdt")                     # debug
+        #self.on_token("btcusdt")                     # debug
 
         # вспомогательный профайлер
         def lap(t0, tag):
@@ -112,7 +118,8 @@ class Orchestrator:
                     dom_all=dom_all,
                     feats=feats,
                     S_cap=64,                        # та же планка, что и у ActionCodec
-                    symbols_order_hint=None          # можно передать твой порядок, если нужен
+                    symbols_order_hint=None,         # можно передать твой порядок, если нужен
+                    debug_timings=True               #debug  
                 )
                 t0, dt_pack, _ = lap(t0, "pack")
 
@@ -120,10 +127,11 @@ class Orchestrator:
                 symbols = payload["symbols"]
 
                 # --- компактный лог раз в N итераций ---
-                if iter_idx % 5 == 0:
+                if iter_idx % 5 == 0 and "timings" in payload:
                     print("symbols: ", symbols)
+                    print(len(symbols))
                     print(f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
-
+                    print("PACK timings (ms):", payload["timings"])
                 if not symbols:
                     continue
 
@@ -162,5 +170,5 @@ class Orchestrator:
                         next_tick += 1
                         miss += 1
                     if miss > 0:
-                        print(f"second missing x{miss} (lag {lag:.3f}s)")
+                        print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! second missing x{miss} (lag {lag:.3f}s) !!!!!!!!!!!!!!!!!!!!!!!!!!")
                 iter_idx += 1
