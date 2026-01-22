@@ -52,9 +52,14 @@ class Orchestrator:
     # === lifecycle ===
     def start(self) -> None:
         self._tg.start(self.on_token)
+        # await tg connection
+        print("[ORCH] waiting for TG ready...")
+        if not self._tg._ready.wait(timeout=900):
+            raise RuntimeError("Telegram did not become ready in time")
+        print("[ORCH] TG ready, starting streams")
+
         self._ohlcv.start()
         self._depth.start()
-        time.sleep(2)
         self._thread.start()
 
         # агрессивно урезаем numpy-печать (на всякий)
@@ -62,6 +67,7 @@ class Orchestrator:
             import numpy as np
             np.set_printoptions(edgeitems=2, threshold=16, suppress=True)
         except Exception:
+            print("[ORCH] не удалось настроить numpy-печать")
             pass
 
     def stop(self) -> None:

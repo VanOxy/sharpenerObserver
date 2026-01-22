@@ -35,6 +35,7 @@ class TelegramObserver:
         self._client: Optional[TelegramClient] = None
         self._on_token: Optional[Callable[[str], None]] = None
 
+        self._ready = threading.Event() # 4 sync others threads launch, after that the tg_channel connection is ok
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -87,6 +88,7 @@ class TelegramObserver:
             return
         
         print("[TG] Listening … (Ctrl+C to stop)")
+
         @client.on(events.NewMessage(chats=self._target_chat))
         async def handler(event):
             try:
@@ -99,9 +101,14 @@ class TelegramObserver:
             except Exception as e:
                 print(f"[TG] handler error: {e}")
 
+        if not self._ready.is_set():        
+            self._ready.set()                            # <<< СИГНАЛ: TG ГОТОВ
+
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(0.5)
         finally:
             await client.disconnect()
             print("[TG] disconnected")
+
+        
