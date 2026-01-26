@@ -9,13 +9,16 @@ class Position:
     avg_px: float = 0.0      # средняя цена входа (по модулю qty)
 
 class PaperBroker:
-    def __init__(self, csv_path: str = "trades.csv", taker_fee_rate: float = 0.00055):
+    def __init__(self, csv_path: str = "trades.csv", taker_fee_rate: float = 0.00055, initial_capital: float = 10000.0):
         self.csv_path = csv_path
         self.taker_fee_rate = taker_fee_rate
-        self.cash = 0.0
+        self.cash = initial_capital
         self.realized_pnl = 0.0
         self.pos: Dict[str, Position] = {}
         self._ensure_header()
+
+        # --- RL-specific fields ---
+        self.last_portfolio_value = initial_capital
 
     def _ensure_header(self):
         need_header = not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0
@@ -118,7 +121,24 @@ class PaperBroker:
                     unrealized += (pos.avg_px - current_price) * abs(pos.qty)
         
         return self.realized_pnl + unrealized
-    
+
+    def get_portfolio_value(self, current_prices: Dict[str, float]) -> float:
+        """
+        Вычисляет текущую полную стоимость портфеля.
+        """
+        total_pnl = self.get_total_pnl(current_prices)
+        return self.cash + total_pnl
+
+    def get_reward_and_update_value(self, current_prices: Dict[str, float]) -> float:
+        """
+        Вычисляет и возвращает вознаграждение (изменение стоимости портфеля) и обновляет last_portfolio_value.
+        Это основной метод для получения reward в RL-цикле.
+        """
+        current_portfolio_value = self.get_portfolio_value(current_prices)
+        reward = current_portfolio_value - self.last_portfolio_value
+        self.last_portfolio_value = current_portfolio_value
+        return reward
+
     def get_positions(self) -> Dict[str, float]:
         """Возвращает текущие позиции: {symbol: qty}."""
         return {sym: pos.qty for sym, pos in self.pos.items() if abs(pos.qty) > 1e-8}

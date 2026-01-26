@@ -3,3 +3,4 @@ python-dotenv>=1.0.0
 websocket-client>=1.6.0
 requests>=2.25.0
 numpy>=2.2.6
+torch>=2.3.0
