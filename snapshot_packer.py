@@ -166,7 +166,7 @@ class SnapshotPacker:
 
         # 5) аллокации - reset только маски (остальные матрицы мы перезапишем строками i< len(used))
         workspace.mask[:] = 0.0
-        t = _lap(t, "pack_ws_reset", tb)
+        if tb is not None: t = _lap(t, "pack_ws_reset", tb)
 
         # 6) основной цикл
         out_symbols: List[str] = []
