@@ -3,11 +3,7 @@ from typing import Dict, List, Optional, Tuple
 import math
 import numpy as np
 from time import perf_counter
-
-def _lap(t0, tag, tb):
-    t1 = perf_counter()
-    tb[tag] = tb.get(tag, 0.0) + (t1 - t0) * 1000.0
-    return t1
+from tools.profiling import StepProfiler    #profiling
 
 class DepthSampler:
     """
@@ -116,14 +112,16 @@ class DepthSampler:
             dtype=self.dtype
         )
 
+    """ Возвращает словарь с массивами и фичами или None, если DOM невалиден.
+        Если передан tb — аккумулируем туда время по этапам. """
     def compress(self, dom_sym: Dict, tb: Optional[Dict[str, float]] = None) -> Optional[Dict]:
-        """Возвращает словарь с массивами и фичами или None, если DOM невалиден.
-            Если передан tb — аккумулируем туда время по этапам.
-        """
-        if not dom_sym:
+        if not dom_sym: 
             return None
-        #debug
-        t = perf_counter() if tb is not None else None
+        
+        # === profiling/debug ===
+        prof = StepProfiler(tb)
+        t0 = perf_counter()
+        #========================
 
         mid = float(dom_sym.get("mid", 0.0))
         bids = dom_sym.get("bids") or []
@@ -132,17 +130,17 @@ class DepthSampler:
             return None
 
         # Top-N
-        if tb is not None: t = _lap(t, "ds_pre_top", tb)
+        t0 = prof.lap(t0, "ds_pre_top")     #profiling
         bid_px, bid_qty = self._top_arrays(bids, self.top_n, descending=True)
-        if tb is not None: t = _lap(t, "ds_top_bids", tb)
+        t0 = prof.lap(t0, "ds_top_bids")    #profiling
         ask_px, ask_qty = self._top_arrays(asks, self.top_n, descending=False)
-        if tb is not None: t = _lap(t, "ds_top_asks", tb)
+        t0 = prof.lap(t0, "ds_top_asks")    #profiling
 
         # Хвосты
         tail_bid = self._tail_bins_qty(bids, self.top_n, mid)
-        if tb is not None: t = _lap(t, "ds_tail_bids", tb)
+        t0 = prof.lap(t0, "ds_tail_bids")   #profiling
         tail_ask = self._tail_bins_qty(asks, self.top_n, mid)
-        if tb is not None: t = _lap(t, "ds_tail_asks", tb)
+        t0 = prof.lap(t0, "ds_tail_asks")   #profiling
 
         # Фичи (imbalance по первым k уровням)
         k = min(self.imb_k, self.top_n)
@@ -155,7 +153,7 @@ class DepthSampler:
         feats = self._fast_feats(
             mid, best_bid_px, best_bid_qty, best_ask_px, best_ask_qty, bid_qty_k, ask_qty_k
         )
-        if tb is not None: _lap(t, "ds_feats", tb)
+        prof.lap(t0, "ds_feats")            #profiling
 
         return {
             "top_bid_px": bid_px,

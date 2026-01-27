@@ -12,19 +12,20 @@ from ws_depth_sampler import DepthSampler
 from snapshot_packer import SnapshotPacker
 from action_codec import ActionCodec
 from paper_broker import PaperBroker
-
+from tools.profiling import StepProfiler    #profiling
 
 def symbol_norm(s: str) -> str:
     return s.strip().lower()
-
-def _ts_ms() -> int:
-    return int(time.time() * 1000)
 
 class Orchestrator:
     """
     - Тикает 1Гц со «стенкой» + poll_delay_ms
     """
     def __init__(self, poll_delay_ms: int = 120):
+        # ===== PROFILING =====
+        self.profiling_activated = True
+        # =====================
+
         # delay for data services to ingest & aggregate data before consuming
         self._poll_delay_ms = poll_delay_ms
 
@@ -85,58 +86,62 @@ class Orchestrator:
     def _run_loop(self) -> None:
         # === планируем по monotonic, выравниваем на ближайшую "целую" секунду ===
         mono = time.monotonic
-        perf = time.perf_counter
         poll_s = self._poll_delay_ms / 1000.0
-        # выравниваемся
-        next_tick = math.floor(mono()) + 1
+        next_tick = math.floor(mono()) + 1  # выравниваемся
 
-        #self.on_token("btcusdt")                     # debug
+        # === profiling/debug ===
+        orch_tb  = {}
+        orch_prof = StepProfiler(orch_tb)
+        #========================
 
-        # вспомогательный профайлер
-        def lap(t0, tag):
-            t1 = perf()
-            dt = (t1 - t0) * 1000.0
-            return t1, dt, tag
-        
-        iter_idx = 0
+        #debug
+        self.on_token("BTCUSDT")
 
+        iter_idx = 0    #index for printing states every 5sec --> debug purpose
         while not self._stop.is_set():
             # подождать до границы + дельта
             sleep_s = (next_tick + poll_s) - mono()
-            print("sleep_s: ", sleep_s)
+            print("sleep_s: ", sleep_s)     #debug --> see how much time left before the next iteration: > 0 is ok
             if sleep_s > 0:
                 self._stop.wait(timeout=sleep_s)
 
-            t0 = perf()
+            orch_prof.reset()           #profiling
+            t0 = time.perf_counter()    #profiling
 
             # job
             try:
                 # get data
                 bars = self._ohlcv.get_all_last_bars() 
-                t0, dt_bars, _ = lap(t0, "bars")
-                dom_all = self._depth.get_all_dom(L=50)           # пока L=40; позже расширим sampler'ом
-                t0, dt_dom, _  = lap(t0, "dom")
+                t0 = orch_prof.lap(t0, "bars")               #profiling
+                dom_all = self._depth.get_all_dom(L=50) 
+                t0 = orch_prof.lap(t0, "dom")                #profiling
                 feats = self._depth.get_all_features()
-                t0, dt_feats, _ = lap(t0, "feats")
+                t0 = orch_prof.lap(t0, "feats")              #profiling
 
+                #packer
                 payload = self.packer.pack(
                     bars=bars,
                     dom_all=dom_all,
                     feats=feats,
-                    S_cap=64,                        # та же планка, что и у ActionCodec
-                    symbols_order_hint=None,         # можно передать твой порядок, если нужен
-                    debug_timings=True               #debug  
+                    S_cap=64,       # та же планка, что и у ActionCodec
+                    symbols_order_hint=None,    # можно передать твой порядок, если нужен
+                    debug_timings=self.profiling_activated   #profiling                 
                 )
-                t0, dt_pack, _ = lap(t0, "pack")
+
+                t0 = orch_prof.lap(t0, "pack_loop_compress_total")  #profiling
+                if self.profiling_activated: 
+                    payload.setdefault("timings", {})
+                    payload["timings"]["orch"] = {
+                        k: round(v, 3) for k, v in orch_tb.items()
+                    }
 
                 # выберем список активных символов (есть валидный DOM+bar)
                 symbols = payload["symbols"]
 
                 # --- компактный лог раз в N итераций ---
                 if iter_idx % 5 == 0 and "timings" in payload:
-                    print("symbols: ", symbols)
-                    print(len(symbols))
-                    print(f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
+                    print("symbols: ", len(symbols), symbols)
+                    #print(f"t_bars={dt_bars:.1f}ms t_dom={dt_dom:.1f}ms t_feats={dt_feats:.1f}ms t_pack={dt_pack:.1f}ms")
                     print("PACK timings (ms):", payload["timings"])
                 if not symbols:
                     continue

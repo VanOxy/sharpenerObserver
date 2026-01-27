@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 from ws_depth_sampler import DepthSampler
 from time import perf_counter
+from tools.profiling import StepProfiler    #profiling
 
 def _bar_to_vec(bar) -> List[float]:
     """Ожидается объект с атрибутами .o .h .l .c .v (как у твоего Bar1s).
@@ -14,13 +15,6 @@ def _bar_to_vec(bar) -> List[float]:
     except AttributeError:
         o, h, l, c, v = [float(bar.get(k, 0.0)) for k in ("o","h","l","c","v")]
     return [o, h, l, c, v]
-
-def _lap(t0, tag, tb):
-    if tb is None:  # быстрый ран без профайла
-        return perf_counter()
-    t1 = perf_counter()
-    tb[tag] = tb.get(tag, 0.0) + (t1 - t0) * 1000.0
-    return t1
 
 @dataclass
 class _Workspace:
@@ -107,13 +101,16 @@ class SnapshotPacker:
     ) -> Dict:
         self._ensure_workspace(S_cap)
         workspace = self._workspace  # type: ignore
-        # 0) debug
+
+        # === profiling/debug ===
         tb = {} if debug_timings else None
-        if tb is not None: t = perf_counter()
+        prof = StepProfiler(tb)
+        t0 = perf_counter()
+        #========================
 
         # 1) пересечение ключей
         sym_set = set(bars.keys()) & set(dom_all.keys()) & set(feats.keys())
-        if tb is not None: t = _lap(t, "pack_sym_set", tb)
+        t0 = prof.lap(t0, "pack_sym_set")    #profiling
         
        # 2) порядок символов
         if symbols_order_hint:
@@ -121,7 +118,7 @@ class SnapshotPacker:
             symbols.extend(sorted(sym_set - set(symbols)))  # добавим недостающие по алфавиту
         else:
             symbols = sorted(sym_set)
-        if tb is not None: t = _lap(t, "pack_order", tb)
+        t0 = prof.lap(t0, "pack_order")     #profiling
 
         # 3) валидация DOM/баров
         valid_syms = []
@@ -147,7 +144,7 @@ class SnapshotPacker:
                     continue
             valid_syms.append(s)
 
-        if tb is not None: t = _lap(t, "pack_validate", tb)
+        t0 = prof.lap(t0, "pack_validate")      #profiling
 
         # 4) ограничение по S_cap и подготовка размеров
         used = valid_syms[:S_cap]
@@ -166,7 +163,7 @@ class SnapshotPacker:
 
         # 5) аллокации - reset только маски (остальные матрицы мы перезапишем строками i< len(used))
         workspace.mask[:] = 0.0
-        if tb is not None: t = _lap(t, "pack_ws_reset", tb)
+        t0 = prof.lap(t0, "pack_ws_reset")      #profiling
 
         # 6) основной цикл
         out_symbols: List[str] = []
@@ -177,14 +174,14 @@ class SnapshotPacker:
             # 6a) бары → вектор
             t_sym = perf_counter() if tb is not None else None
             workspace.bars_mat[i, :] = np.asarray(_bar_to_vec(bars[s]), dtype=self.dtype)
-            if tb is not None: t_sym = _lap(t_sym, "pack_loop_bar", tb)     #debug
+            t0 = prof.lap(t0, "pack_loop_bar")      #profiling
 
             # 6b) depth compress
             comp = self.sampler.compress(dom_all[s], tb=tb)
             if comp is None:
                 # маска останется 1, но данные нулевые — при желании можно занулить mask[i]
                 continue
-            if tb is not None: t_sym = _lap(t_sym, "pack_loop_compress", tb)
+            t0 = prof.lap(t0, "pack_loop_compress")   #profiling
 
             # 6c) запись результатов семплера
             workspace.depth_top_px[i, 0, :] = comp["top_bid_px"]
@@ -197,7 +194,7 @@ class SnapshotPacker:
                 workspace.depth_tail_qty[i, 1, :] = comp["tail_ask_qty"]
             # быстрые фичи
             workspace.depth_feats[i, :] = comp["depth_feats"]
-            if tb is not None: t_sym = _lap(t_sym, "pack_loop_write", tb)
+            t0 = prof.lap(t0, "pack_loop_write")      #profiling
 
             # 6d) доп. фичи из feats
             f = feats.get(s) or {}
@@ -207,7 +204,7 @@ class SnapshotPacker:
                     workspace.extra_mat[i, j] = float(v)
                 except Exception:
                     workspace.extra_mat[i, j] = 0.0
-            if tb is not None: _lap(t_sym, "pack_loop_extras", tb)
+            t0 = prof.lap(t0, "pack_loop_extras")    #profiling
 
         # 7) собрать выход
         out = {
