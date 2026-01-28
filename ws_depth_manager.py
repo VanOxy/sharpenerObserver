@@ -67,10 +67,6 @@ class TokenOrderBook:
             self._asks = new_asks
             self._last_update_id = last_update_id
 
-        print(self._asks)
-        print(self._bids)
-
-
     def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
         """Принимает изменения (диффы) из WebSocket
         Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется."""
