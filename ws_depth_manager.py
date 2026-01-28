@@ -24,8 +24,8 @@ GC_INTERVAL_SEC = 1
 
 
 # --------------------------- Utilities ---------------------------
-
 def _parse_price_qty(pair: List[str]) -> Tuple[float, float]:
+    """['89384.80', '0.026'] string -> [89384.80, 0.026] tuple"""
     try:
         p = float(pair[0])
         q = float(pair[1])
@@ -33,10 +33,10 @@ def _parse_price_qty(pair: List[str]) -> Tuple[float, float]:
     except Exception:
         return 0.0, 0.0
 
-
-class LocalOrderBook:
+class TokenOrderBook:
     """
-    Thread-safe local order book for a single symbol.
+    Thread-safe local order book for a SINGLE symbol.
+    Хранилище данных. Содержит лимитные заявки на покупку (bids) и продажу (asks).
     """
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
@@ -47,38 +47,56 @@ class LocalOrderBook:
 
     # ---------------- Snapshot & Updates ----------------
     def load_snapshot(self, bids: List[List[str]], asks: List[List[str]], last_update_id: int) -> None:
+        """очищает стакан и записывает новые данные, полученные через REST API"""
+        #bids&asks: [['89384.80', '0.026'], ['89384.70', '0.020'], ['89384.60', '0.002'], ..]
+        new_bids = {} 
+        new_asks = {}
+
+        for price, qty in bids:
+            p, q = _parse_price_qty([price, qty])
+            if q > 0:
+                new_bids[p] = q
+
+        for price, qty in asks:
+            p, q = _parse_price_qty([price, qty])
+            if q > 0:
+                new_asks[p] = q
+
         with self._lock:
-            self._bids.clear()
-            self._asks.clear()
-            for px, qty in bids:
-                p, q = _parse_price_qty([px, qty])
-                if q > 0:
-                    self._bids[p] = q
-            for px, qty in asks:
-                p, q = _parse_price_qty([px, qty])
-                if q > 0:
-                    self._asks[p] = q
+            self._bids = new_bids
+            self._asks = new_asks
             self._last_update_id = last_update_id
 
-    def apply_deltas(self, b_deltas: List[List[str]], a_deltas: List[List[str]], u: int) -> None:
+        print(self._asks)
+        print(self._bids)
+
+
+    def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
+        """Принимает изменения (диффы) из WebSocket
+        Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется."""
         with self._lock:
-            for px, qty in b_deltas:
-                p, q = _parse_price_qty([px, qty])
+            #=============================
+            print("b_deltas: ", bid_deltas) #debug --> to remove after
+            print("a_deltas: ", ask_deltas) #debug --> to remove after
+            #=============================
+            for price, qty in bid_deltas:
+                p, q = _parse_price_qty([price, qty])
                 if q == 0:
                     self._bids.pop(p, None)
                 else:
                     self._bids[p] = q
-            for px, qty in a_deltas:
-                p, q = _parse_price_qty([px, qty])
+            for price, qty in ask_deltas:
+                p, q = _parse_price_qty([price, qty])
                 if q == 0:
                     self._asks.pop(p, None)
                 else:
                     self._asks[p] = q
-            self._last_update_id = u
+            self._last_update_id = last_update_id
 
     # ---------------- Queries ----------------
-    def get_top_L(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        """Топ-L уровней: bids по убыванию цены, asks по возрастанию."""
+    def get_top_levels(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """Топ N уровней: bids по убыванию цены, asks по возрастанию.
+        Возвращает n лучших цен покупки и продажи"""
         with self._lock:
             bids_sorted = sorted(self._bids.items(), key=lambda x: x[0], reverse=True)[:n]
             asks_sorted = sorted(self._asks.items(), key=lambda x: x[0])[:n]
@@ -86,7 +104,7 @@ class LocalOrderBook:
         
     def get_dom_snapshot(self, L: int = 20) -> Dict[str, object]:
         """DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно."""
-        bids, asks = self.get_top_L(L)
+        bids, asks = self.get_top_levels(L)
         best_bid = bids[0][0] if bids else 0.0
         best_ask = asks[0][0] if asks else 0.0
         mid = (best_bid + best_ask) / 2.0 if (best_bid and best_ask) else 0.0
@@ -154,7 +172,7 @@ class LocalOrderBook:
         return num / den
 
     def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
-        bids, asks = self.get_top_L(n)
+        bids, asks = self.get_top_levels(n)
 
         sum_bid_usd, used_bids = self._sum_top_n_usd(bids, n)
         sum_ask_usd, used_asks = self._sum_top_n_usd(asks, n)
@@ -189,10 +207,11 @@ class LocalOrderBook:
 class _SymbolDepthWorker(threading.Thread):
     """
     One worker per symbol: REST snapshot + WS diffs, sequence handling, resync.
+    «Рабочий», который отвечает за сетевое взаимодействие для конкретной монеты (подключение к сокету, загрузка снимка, синхронизация).
     """
     daemon = True
 
-    def __init__(self, symbol: str, orderbook: LocalOrderBook, session: Optional[requests.Session] = None, *, verbose: bool = False):
+    def __init__(self, symbol: str, orderbook: TokenOrderBook, session: Optional[requests.Session] = None, *, verbose: bool = False):
         super().__init__(name=f"DepthWorker-{symbol.upper()}")
         self.symbol = symbol.lower()
         self.sym_u = symbol.upper()
@@ -328,13 +347,15 @@ class _SymbolDepthWorker(threading.Thread):
 # ------- per-symbol state for manager -------
 @dataclass
 class _SymState:
-    book: LocalOrderBook
+    book: TokenOrderBook
     worker: _SymbolDepthWorker
     last_access_ts: float   # updated ONLY on touch()
 
-
 class DepthBooksManager:
-    """ авто-эвикшн по неактивности """
+    """ 
+    Высокоуровневый интерфейс. Он управляет списком всех отслеживаемых монет и автоматически удаляет те, 
+    которыми давно не интересовались (Auto-eviction).
+    """
     def __init__(self, auto_evict_sec: int = AUTO_EVICT_SEC):
         self._states: Dict[str, _SymState] = {}
         self._lock = threading.RLock()
@@ -353,7 +374,7 @@ class DepthBooksManager:
             if st is not None:
                 st.last_access_ts = now  # TTL продлеваем ТОЛЬКО здесь
                 return
-            book = LocalOrderBook(sym_u)
+            book = TokenOrderBook(sym_u)
             print(f"🚀 Starting Depth stream for {sym_u}")
             worker = _SymbolDepthWorker(sym_l, book, session=self._session)
             self._states[sym_l] = _SymState(book=book, worker=worker, last_access_ts=now)
