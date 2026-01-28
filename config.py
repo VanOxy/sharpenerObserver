@@ -15,6 +15,8 @@ class Config:
     TTL_SECONDS = float(os.getenv('TTL_SECONDS'))
     AGG_INTERVAL_SEC = float(os.getenv('AGG_INTERVAL_SEC'))
     
+    PROFILING = True
+    
     @classmethod
     def validate(cls):
         required_fields = ['API_ID', 'API_HASH', 'TELEGRAM_PHONE', 'CHANNEL_NAME', 'TTL_SECONDS', 'AGG_INTERVAL_SEC']
