@@ -12,6 +12,7 @@ from ws_depth_sampler import DepthSampler
 from snapshot_packer import SnapshotPacker
 from action_codec import ActionCodec
 from paper_broker import PaperBroker
+from config import Config
 from tools.profiling import StepProfiler    #profiling
 
 def symbol_norm(s: str) -> str:
@@ -23,7 +24,7 @@ class Orchestrator:
     """
     def __init__(self, poll_delay_ms: int = 120):
         # ===== PROFILING =====
-        self.profiling_activated = True
+        self.profiling_activated = Config.PROFILING
         # =====================
 
         # delay for data services to ingest & aggregate data before consuming
