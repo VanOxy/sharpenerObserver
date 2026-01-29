@@ -47,7 +47,7 @@ class TokenOrderBook:
 
     # ---------------- Snapshot & Updates ----------------
     def load_snapshot(self, bids: List[List[str]], asks: List[List[str]], last_update_id: int) -> None:
-        """очищает стакан и записывает новые данные, полученные через REST API"""
+        """записывает новые данные, полученные через REST API"""
         #bids&asks: [['89384.80', '0.026'], ['89384.70', '0.020'], ['89384.60', '0.002'], ..]
         new_bids = {} 
         new_asks = {}
@@ -70,19 +70,22 @@ class TokenOrderBook:
     def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
         """Принимает изменения (диффы) из WebSocket
         Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется."""
+
+        prepared_bids = []
+        for price, qty in bid_deltas:
+            prepared_bids.append(_parse_price_qty([price, qty]))
+
+        prepared_asks = []
+        for price, qty in ask_deltas:
+            prepared_asks.append(_parse_price_qty([price, qty]))
+
         with self._lock:
-            #=============================
-            print("b_deltas: ", bid_deltas) #debug --> to remove after
-            print("a_deltas: ", ask_deltas) #debug --> to remove after
-            #=============================
-            for price, qty in bid_deltas:
-                p, q = _parse_price_qty([price, qty])
+            for p, q in prepared_bids:
                 if q == 0:
                     self._bids.pop(p, None)
                 else:
                     self._bids[p] = q
-            for price, qty in ask_deltas:
-                p, q = _parse_price_qty([price, qty])
+            for p, q in prepared_asks:
                 if q == 0:
                     self._asks.pop(p, None)
                 else:
