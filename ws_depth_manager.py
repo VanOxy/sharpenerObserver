@@ -110,23 +110,30 @@ class TokenOrderBook:
         best_bid = bids[0][0] if bids else 0.0
         best_ask = asks[0][0] if asks else 0.0
         mid = (best_bid + best_ask) / 2.0 
-        spread = (best_ask - best_bid)
-
-        def pack(prices: List[Tuple[float, float]]):
-            # вернём и относительную цену к mid — удобно для нормализации
-            out = []
-            for px, qty in prices:
-                usd = px * qty
-                rel = ((px - mid) / mid) if mid > 0 else 0.0
-                out.append({"px": px, "qty": qty, "usd": usd, "rel": rel})
-            return out
+        # Оптимизация математики в цикле: деление — дорогая операция. 
+        # Вычисляем один раз коэффициент для умножения. Вместо ((px - mid) / mid)
+        inv_mid_coefficient = 1.0 / mid if mid > 0 else 0.0
 
         return {
             "symbol": self.symbol,
             "mid": mid,
-            "spread": spread,
-            "bids": pack(bids),   # длина ≤ L
-            "asks": pack(asks),   # длина ≤ L
+            "spread": best_ask - best_bid, 
+            "bids": [
+                {
+                    "px": px, 
+                    "qty": qty, 
+                    "usd": px * qty, 
+                    "rel": (px - mid) * inv_mid_coefficient
+                } for px, qty in bids
+            ],
+            "asks": [
+                {
+                    "px": px, 
+                    "qty": qty, 
+                    "usd": px * qty, 
+                    "rel": (px - mid) * inv_mid_coefficient
+                } for px, qty in asks
+            ],
         }
 
     # ======= Метрики в USDT (quote) =======

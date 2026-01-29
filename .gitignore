@@ -4,3 +4,4 @@ venv
 .env
 tg_session.session
 trades.csv
+todo.txt
