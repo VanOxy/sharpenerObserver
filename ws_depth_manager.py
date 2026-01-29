@@ -25,13 +25,11 @@ GC_INTERVAL_SEC = 1
 
 
 # --------------------------- Utilities ---------------------------
-def _parse_price_qty(pair: List[str]) -> Tuple[float, float]:
+def _parse_price_qty(price_str: str, qty_str: str) -> Tuple[float, float]:
     """string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]"""
     try:
-        p = float(pair[0])
-        q = float(pair[1])
-        return p, q
-    except Exception:
+        return float(price_str), float(qty_str)
+    except (ValueError, TypeError):
         return 0.0, 0.0
 
 class TokenOrderBook:
@@ -54,12 +52,12 @@ class TokenOrderBook:
         new_asks = {}
 
         for price, qty in bids:
-            p, q = _parse_price_qty([price, qty])
+            p, q = _parse_price_qty(price, qty)
             if q > 0:
                 new_bids[p] = q
 
         for price, qty in asks:
-            p, q = _parse_price_qty([price, qty])
+            p, q = _parse_price_qty(price, qty)
             if q > 0:
                 new_asks[p] = q
 
@@ -78,11 +76,11 @@ class TokenOrderBook:
 
         prepared_bids = []
         for price, qty in bid_deltas:
-            prepared_bids.append(_parse_price_qty([price, qty]))
+            prepared_bids.append(_parse_price_qty(price, qty))
 
         prepared_asks = []
         for price, qty in ask_deltas:
-            prepared_asks.append(_parse_price_qty([price, qty]))
+            prepared_asks.append(_parse_price_qty(price, qty))
 
         with self._lock:
             for p, q in prepared_bids:
@@ -100,24 +98,24 @@ class TokenOrderBook:
     # ---------------- Queries ----------------
     def get_top_levels(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         """Возвращает топ N уровней стакана: bids (самые дорогие), asks (самые дешевые)."""
-        price_key = itemgetter(0)  # Кэшируем itemgetter заранее (еще капля оптимизации)
+        price_key = itemgetter(0)  # Кэшируем itemgetter заранее (для оптимизации)
         with self._lock:
             bids_top = heapq.nlargest(n, self._bids.items(), key=price_key) #покупки
             asks_top = heapq.nsmallest(n, self._asks.items(), key=price_key)#продажи
             return bids_top, asks_top
         
-    def get_dom_snapshot(self, L: int = 20) -> Dict[str, object]:
+    def get_dom_snapshot(self, L: int = 50) -> Dict[str, object]:
         """DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно."""
         bids, asks = self.get_top_levels(L)
         best_bid = bids[0][0] if bids else 0.0
         best_ask = asks[0][0] if asks else 0.0
-        mid = (best_bid + best_ask) / 2.0 if (best_bid and best_ask) else 0.0
-        spread = (best_ask - best_bid) if (best_bid and best_ask) else 0.0
+        mid = (best_bid + best_ask) / 2.0 
+        spread = (best_ask - best_bid)
 
-        def pack(levels):
+        def pack(prices: List[Tuple[float, float]]):
             # вернём и относительную цену к mid — удобно для нормализации
             out = []
-            for px, qty in levels:
+            for px, qty in prices:
                 usd = px * qty
                 rel = ((px - mid) / mid) if mid > 0 else 0.0
                 out.append({"px": px, "qty": qty, "usd": usd, "rel": rel})
