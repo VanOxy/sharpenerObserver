@@ -1,14 +1,15 @@
 # file: ws_depth_manager.py
+from config import Config
+import requests
+from websocket import WebSocketApp
 import json
 import threading
 import time
 import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-from config import Config
-
-import requests
-from websocket import WebSocketApp
+from operator import itemgetter
+import heapq
 
 # --- Config ---
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
@@ -25,7 +26,7 @@ GC_INTERVAL_SEC = 1
 
 # --------------------------- Utilities ---------------------------
 def _parse_price_qty(pair: List[str]) -> Tuple[float, float]:
-    """['89384.80', '0.026'] string -> [89384.80, 0.026] tuple"""
+    """string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]"""
     try:
         p = float(pair[0])
         q = float(pair[1])
@@ -70,6 +71,10 @@ class TokenOrderBook:
     def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
         """Принимает изменения (диффы) из WebSocket
         Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется."""
+        #=============================
+        print("b_deltas: ", bid_deltas) #debug --> to remove after
+        print("a_deltas: ", ask_deltas) #debug --> to remove after
+        #=============================
 
         prepared_bids = []
         for price, qty in bid_deltas:
@@ -94,12 +99,12 @@ class TokenOrderBook:
 
     # ---------------- Queries ----------------
     def get_top_levels(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        """Топ N уровней: bids по убыванию цены, asks по возрастанию.
-        Возвращает n лучших цен покупки и продажи"""
+        """Возвращает топ N уровней стакана: bids (самые дорогие), asks (самые дешевые)."""
+        price_key = itemgetter(0)  # Кэшируем itemgetter заранее (еще капля оптимизации)
         with self._lock:
-            bids_sorted = sorted(self._bids.items(), key=lambda x: x[0], reverse=True)[:n]
-            asks_sorted = sorted(self._asks.items(), key=lambda x: x[0])[:n]
-            return bids_sorted, asks_sorted
+            bids_top = heapq.nlargest(n, self._bids.items(), key=price_key) #покупки
+            asks_top = heapq.nsmallest(n, self._asks.items(), key=price_key)#продажи
+            return bids_top, asks_top
         
     def get_dom_snapshot(self, L: int = 20) -> Dict[str, object]:
         """DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно."""
@@ -459,7 +464,7 @@ class DepthBooksManager:
         return out
     
 
-
+"""
 # --------------------------- Minimal self-test ---------------------------
 if __name__ == "__main__":
     mgr = DepthBooksManager(AUTO_EVICT_SEC)
@@ -507,3 +512,4 @@ if __name__ == "__main__":
             
     except KeyboardInterrupt:
         mgr.stop()
+"""
