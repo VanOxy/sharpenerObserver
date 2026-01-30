@@ -84,8 +84,8 @@ class TokenOrderBook:
         """Принимает изменения (диффы) из WebSocket
         Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется."""
         #=============================
-        print("b_deltas: ", bid_deltas) #debug --> to remove after
-        print("a_deltas: ", ask_deltas) #debug --> to remove after
+        print("apply_deltas.b_deltas: ", bid_deltas) #debug --> to remove after
+        print("apply_deltas.a_deltas: ", ask_deltas) #debug --> to remove after
         #=============================
 
         prepared_bids = [self._parse_price_qty(price, qty) for price, qty in bid_deltas]
@@ -135,10 +135,9 @@ class TokenOrderBook:
             ],
         }
 
-    # ======= Метрики в USDT (quote) =======
+    """
     @staticmethod
     def _sum_top_n_usd(levels: List[Tuple[float, float]], n: int) -> Tuple[float, List[Tuple[float, float]]]:
-        """Считает суммарный объем в долларах для первых n уровней. Это показатель ликвидности «в моменте»"""
         used = levels[:n]
         total = 0.0
         for p, q in used:
@@ -147,8 +146,6 @@ class TokenOrderBook:
 
     @staticmethod
     def _wall_by_usd(levels: List[Tuple[float, float]], n: int) -> Tuple[float, float, float]:
-        """Ищет «стенку» — уровень с самым большим объемом в долларах среди первых n. 
-        Это потенциальное сопротивление или поддержка."""
         best_p, best_q, best_usd = 0.0, 0.0, -1.0
         for p, q in levels[:n]:
             usd = p * q
@@ -159,9 +156,6 @@ class TokenOrderBook:
 
     @staticmethod
     def _impact_price_usd(levels: List[Tuple[float, float]], target_usd: float) -> float:
-        """Оценивает «цену исполнения». 
-        Если ты захочешь купить/продать сразу на target_usd, до какой цены ты «прошьешь» стакан? 
-        По сути — оценка проскальзывания."""
         if not levels or target_usd <= 0:
             return 0.0
         acc = 0.0
@@ -174,8 +168,6 @@ class TokenOrderBook:
 
     @staticmethod
     def _slope_usd(levels: List[Tuple[float, float]], n: int) -> float:
-        """Это линейная регрессия. Она показывает «наклон» ликвидности:
-          как быстро растет/падает объем в зависимости от удаления от лучшей цены."""
         m = min(len(levels), n)
         if m <= 1:
             return 0.0
@@ -187,8 +179,7 @@ class TokenOrderBook:
         den = sum((x - mean_x) ** 2 for x in xs) or 1.0
         return num / den
 
-    def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
-        """Главный диспетчер. Генерит фичи из данных о стакане"""
+    def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]: #unoptimized version
         bids, asks = self.get_top_levels(n)
 
         sum_bid_usd, used_bids = self._sum_top_n_usd(bids, n)
@@ -218,6 +209,93 @@ class TokenOrderBook:
             "wall_ask_usd": round(float(wall_ask_usd), 6),
             "impact_buy_px": float(impact_buy_px),
             "impact_sell_px": float(impact_sell_px),
+        }
+    """
+
+    @staticmethod
+    def _process_side(levels: List[Tuple[float, float]], impact_usd: float) -> Dict[str, float]:
+        """Вычисляет сумму, стенку, цену воздействия и данные для наклона за ОДИН проход. O(n*log(n))"""
+        """1.Считает суммарный объем в долларах для первых n уровней. Это показатель ликвидности «в моменте»"""
+        """2.Ищет «стенку» — уровень с самым большим объемом в долларах среди первых n. Это потенциальное сопротивление или поддержка."""
+        """3.Оценивает «цену исполнения». Если ты захочешь купить/продать сразу на target_usd, до какой цены ты «прошьешь» стакан? По сути — оценка проскальзывания."""
+        """4.Линейная регрессия показывает «наклон» ликвидности: как быстро растет/падает объем в зависимости от удаления от лучшей цены."""
+        
+        total_usd = 0.0
+        max_usd = -1.0
+        wall_px = 0.0
+        impact_px = levels[-1][0] if levels else 0.0
+        impact_found = False
+
+        # Для наклона (регрессии)
+        sum_x = 0.0         #сумма индексов: 0, 1, 2...
+        sum_y = 0.0         #сумма объемов
+        sum_xy = 0.0        #сумма произведений индекса на объем
+        sum_xx = 0.0        #сумма квадратов индексов
+
+        # Мы работаем ровно с тем количеством уровней, которое пришло
+        m = len(levels)
+
+        for i in range(m):
+            p, q = levels[i]
+            usd = p * q
+            # 1. Сумма
+            total_usd += usd
+            # 2. Стенка
+            if usd > max_usd:
+                max_usd = usd
+                wall_px = p
+            # 3. Impact (цена воздействия)
+            if not impact_found:
+                if total_usd >= impact_usd:
+                    impact_px = p
+                    impact_found = True
+            # 4. Накопление данных для Slope (y = usd, x = i)
+            sum_x += i              #sum_indices
+            sum_y += usd            #sum_volumes
+            sum_xy += i * usd       #sum_index_times_volume
+            sum_xx += i * i         #sum_index_squared
+            
+        # Считаем наклон (Slope)
+        if m > 1:
+            # Формула линейной регрессии: (n*sum(xy) - sum(x)*sum(y)) / (n*sum(x^2) - sum(x)^2)
+            numerator = (m * sum_xy) - (sum_x * sum_y)
+            denominator = (m * sum_xx) - (sum_x**2)
+            slope = numerator / denominator if denominator != 0 else 0.0
+        else:
+            slope = 0.0
+            
+        return {
+            "sum": total_usd,
+            "wall_px": wall_px,
+            "wall_usd": max_usd,
+            "impact_px": impact_px,
+            "slope": slope
+        }
+    
+    def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
+        """Главный диспетчер. Генерит фичи из данных о стакане"""
+        # Получаем данные из стакана (уже отсеченные до n под замком)
+        bids, asks = self.get_top_levels(n)
+        
+        # Обрабатываем каждую сторону за один проход
+        bid_features = self._process_side(bids, impact_usdt)
+        ask_features = self._process_side(asks, impact_usdt)
+        
+        total_vol = bid_features["sum"] + ask_features["sum"]
+        imbalance = (bid_features["sum"] - ask_features["sum"]) / total_vol if total_vol > 0 else 0.0
+        
+        return {
+            "sum_bid_n_usd": round(bid_features["sum"], 6),
+            "sum_ask_n_usd": round(ask_features["sum"], 6),
+            "cum_imbalance_n_usd": float(imbalance),
+            "slope_bid_n_usd": float(bid_features["slope"]),
+            "slope_ask_n_usd": float(ask_features["slope"]),
+            "wall_bid_px": bid_features["wall_px"],
+            "wall_bid_usd": round(bid_features["wall_usd"], 6),
+            "wall_ask_px": ask_features["wall_px"],
+            "wall_ask_usd": round(ask_features["wall_usd"], 6),
+            "impact_buy_px": ask_features["impact_px"],  # Покупаем у асков
+            "impact_sell_px": bid_features["impact_px"], # Продаем бидам
         }
 
 
