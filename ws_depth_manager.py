@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, TypedDict
 from operator import itemgetter
 import heapq
 
@@ -23,26 +23,42 @@ HTTP_TIMEOUT = 5
 AUTO_EVICT_SEC = Config.TTL_SECONDS
 GC_INTERVAL_SEC = 1
 
+class DOMLevel(TypedDict):
+    px: float
+    qty: float
+    usd: float
+    rel: float
 
-# --------------------------- Utilities ---------------------------
-def _parse_price_qty(price_str: str, qty_str: str) -> Tuple[float, float]:
-    """string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]"""
-    try:
-        return float(price_str), float(qty_str)
-    except (ValueError, TypeError):
-        return 0.0, 0.0
+class DOMSnapshot(TypedDict):
+    symbol: str
+    mid: float
+    spread: float
+    bids: List[DOMLevel]
+    asks: List[DOMLevel]
 
 class TokenOrderBook:
     """
     Thread-safe local order book for a SINGLE symbol.
     Хранилище данных. Содержит лимитные заявки на покупку (bids) и продажу (asks).
     """
+    _price_key = itemgetter(0)  # Кэшируем itemgetter заранее (для оптимизации)
+
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
+        self._lock = threading.RLock()
+
         self._bids: Dict[float, float] = {}
         self._asks: Dict[float, float] = {}
-        self._lock = threading.RLock()
         self._last_update_id: Optional[int] = None
+
+    # --------------------------- Utilities ---------------------------
+    @staticmethod
+    def _parse_price_qty(price_str: str, qty_str: str) -> Tuple[float, float]:
+        """string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]"""
+        try:
+            return float(price_str), float(qty_str)
+        except (ValueError, TypeError):
+            return 0.0, 0.0
 
     # ---------------- Snapshot & Updates ----------------
     def load_snapshot(self, bids: List[List[str]], asks: List[List[str]], last_update_id: int) -> None:
@@ -52,14 +68,12 @@ class TokenOrderBook:
         new_asks = {}
 
         for price, qty in bids:
-            p, q = _parse_price_qty(price, qty)
-            if q > 0:
-                new_bids[p] = q
+            p, q = self._parse_price_qty(price, qty)
+            if q > 0: new_bids[p] = q
 
         for price, qty in asks:
-            p, q = _parse_price_qty(price, qty)
-            if q > 0:
-                new_asks[p] = q
+            p, q = self._parse_price_qty(price, qty)
+            if q > 0: new_asks[p] = q
 
         with self._lock:
             self._bids = new_bids
@@ -74,39 +88,32 @@ class TokenOrderBook:
         print("a_deltas: ", ask_deltas) #debug --> to remove after
         #=============================
 
-        prepared_bids = []
-        for price, qty in bid_deltas:
-            prepared_bids.append(_parse_price_qty(price, qty))
-
-        prepared_asks = []
-        for price, qty in ask_deltas:
-            prepared_asks.append(_parse_price_qty(price, qty))
+        prepared_bids = [self._parse_price_qty(price, qty) for price, qty in bid_deltas]
+        prepared_asks = [self._parse_price_qty(price, qty) for price, qty in ask_deltas]
 
         with self._lock:
             for p, q in prepared_bids:
-                if q == 0:
-                    self._bids.pop(p, None)
-                else:
-                    self._bids[p] = q
+                if q == 0: self._bids.pop(p, None)
+                else: self._bids[p] = q
+
             for p, q in prepared_asks:
-                if q == 0:
-                    self._asks.pop(p, None)
-                else:
-                    self._asks[p] = q
+                if q == 0: self._asks.pop(p, None)
+                else: self._asks[p] = q
+
             self._last_update_id = last_update_id
 
     # ---------------- Queries ----------------
     def get_top_levels(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         """Возвращает топ N уровней стакана: bids (самые дорогие), asks (самые дешевые)."""
-        price_key = itemgetter(0)  # Кэшируем itemgetter заранее (для оптимизации)
         with self._lock:
-            bids_top = heapq.nlargest(n, self._bids.items(), key=price_key) #покупки
-            asks_top = heapq.nsmallest(n, self._asks.items(), key=price_key)#продажи
+            bids_top = heapq.nlargest(n, self._bids.items(), key=self._price_key) #покупки
+            asks_top = heapq.nsmallest(n, self._asks.items(), key=self._price_key)#продажи
             return bids_top, asks_top
         
-    def get_dom_snapshot(self, L: int = 50) -> Dict[str, object]:
+    def get_dom_snapshot(self, L: int = 50) -> DOMSnapshot:
         """DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно."""
         bids, asks = self.get_top_levels(L)
+
         best_bid = bids[0][0] if bids else 0.0
         best_ask = asks[0][0] if asks else 0.0
         mid = (best_bid + best_ask) / 2.0 
@@ -119,26 +126,19 @@ class TokenOrderBook:
             "mid": mid,
             "spread": best_ask - best_bid, 
             "bids": [
-                {
-                    "px": px, 
-                    "qty": qty, 
-                    "usd": px * qty, 
-                    "rel": (px - mid) * inv_mid_coefficient
-                } for px, qty in bids
+                {"px": px, "qty": qty, "usd": px * qty, "rel": (px - mid) * inv_mid_coefficient}
+                for px, qty in bids
             ],
             "asks": [
-                {
-                    "px": px, 
-                    "qty": qty, 
-                    "usd": px * qty, 
-                    "rel": (px - mid) * inv_mid_coefficient
-                } for px, qty in asks
+                {"px": px, "qty": qty, "usd": px * qty, "rel": (px - mid) * inv_mid_coefficient}
+                for px, qty in asks
             ],
         }
 
     # ======= Метрики в USDT (quote) =======
     @staticmethod
     def _sum_top_n_usd(levels: List[Tuple[float, float]], n: int) -> Tuple[float, List[Tuple[float, float]]]:
+        """Считает суммарный объем в долларах для первых n уровней. Это показатель ликвидности «в моменте»"""
         used = levels[:n]
         total = 0.0
         for p, q in used:
@@ -147,6 +147,8 @@ class TokenOrderBook:
 
     @staticmethod
     def _wall_by_usd(levels: List[Tuple[float, float]], n: int) -> Tuple[float, float, float]:
+        """Ищет «стенку» — уровень с самым большим объемом в долларах среди первых n. 
+        Это потенциальное сопротивление или поддержка."""
         best_p, best_q, best_usd = 0.0, 0.0, -1.0
         for p, q in levels[:n]:
             usd = p * q
@@ -157,6 +159,9 @@ class TokenOrderBook:
 
     @staticmethod
     def _impact_price_usd(levels: List[Tuple[float, float]], target_usd: float) -> float:
+        """Оценивает «цену исполнения». 
+        Если ты захочешь купить/продать сразу на target_usd, до какой цены ты «прошьешь» стакан? 
+        По сути — оценка проскальзывания."""
         if not levels or target_usd <= 0:
             return 0.0
         acc = 0.0
@@ -169,6 +174,8 @@ class TokenOrderBook:
 
     @staticmethod
     def _slope_usd(levels: List[Tuple[float, float]], n: int) -> float:
+        """Это линейная регрессия. Она показывает «наклон» ликвидности:
+          как быстро растет/падает объем в зависимости от удаления от лучшей цены."""
         m = min(len(levels), n)
         if m <= 1:
             return 0.0
@@ -181,6 +188,7 @@ class TokenOrderBook:
         return num / den
 
     def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
+        """Главный диспетчер. Генерит фичи из данных о стакане"""
         bids, asks = self.get_top_levels(n)
 
         sum_bid_usd, used_bids = self._sum_top_n_usd(bids, n)
