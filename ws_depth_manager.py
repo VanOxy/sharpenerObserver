@@ -37,6 +37,7 @@ class DOMSnapshot(TypedDict):
     asks: List[DOMLevel]
 
 class TokenOrderBook:
+    #Стакан
     #Thread-safe local order book for a SINGLE symbol.
     #Хранилище данных. Содержит лимитные заявки на покупку (bids) и продажу (asks).
     _price_key = itemgetter(0)  # Кэшируем itemgetter заранее (для оптимизации)
@@ -275,8 +276,17 @@ class TokenOrderBook:
         
         # Получаем данные из стакана (уже отсеченные до n под замком)
         bids, asks = self.get_top_levels(n)
+
+        # 1. Считаем базовые параметры спреда
+        best_bid = bids[0][0] if bids else 0.0
+        best_ask = asks[0][0] if asks else 0.0
+        mid = (best_bid + best_ask) / 2.0 
+        spread = best_ask - best_bid
+        # Относительный спред в базисных пунктах (1 bps = 0.01%)
+        # Это одна из самых важных фичей для оценки стоимости входа/выхода
+        rel_spread_bps = (spread / mid) * 10000 if mid > 0 else 0.0 #BPS_CONVERSION = 10_000
         
-        # Обрабатываем каждую сторону за один проход
+        # 2. Обрабатываем каждую сторону за один проход
         bid_features = self._process_side(bids, impact_usdt)
         ask_features = self._process_side(asks, impact_usdt)
         
@@ -294,7 +304,10 @@ class TokenOrderBook:
             "wall_ask_px": ask_features["wall_px"],
             "wall_ask_usd": round(ask_features["wall_usd"], 6),
             "impact_buy_px": ask_features["impact_px"],  
-            "impact_sell_px": bid_features["impact_px"]
+            "impact_sell_px": bid_features["impact_px"],
+            "mid_price": float(mid),
+            "spread_usd": float(spread),
+            "rel_spread_bps": float(rel_spread_bps), # Относительный спред
         }
 
 
