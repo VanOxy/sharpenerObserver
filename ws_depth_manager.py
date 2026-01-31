@@ -37,10 +37,8 @@ class DOMSnapshot(TypedDict):
     asks: List[DOMLevel]
 
 class TokenOrderBook:
-    """
-    Thread-safe local order book for a SINGLE symbol.
-    Хранилище данных. Содержит лимитные заявки на покупку (bids) и продажу (asks).
-    """
+    #Thread-safe local order book for a SINGLE symbol.
+    #Хранилище данных. Содержит лимитные заявки на покупку (bids) и продажу (asks).
     _price_key = itemgetter(0)  # Кэшируем itemgetter заранее (для оптимизации)
 
     def __init__(self, symbol: str):
@@ -54,7 +52,7 @@ class TokenOrderBook:
     # --------------------------- Utilities ---------------------------
     @staticmethod
     def _parse_price_qty(price_str: str, qty_str: str) -> Tuple[float, float]:
-        """string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]"""
+        #string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]
         try:
             return float(price_str), float(qty_str)
         except (ValueError, TypeError):
@@ -62,7 +60,7 @@ class TokenOrderBook:
 
     # ---------------- Snapshot & Updates ----------------
     def load_snapshot(self, bids: List[List[str]], asks: List[List[str]], last_update_id: int) -> None:
-        """записывает новые данные, полученные через REST API"""
+        #записывает новые данные, полученные через REST API
         #bids&asks: [['89384.80', '0.026'], ['89384.70', '0.020'], ['89384.60', '0.002'], ..]
         new_bids = {} 
         new_asks = {}
@@ -81,8 +79,8 @@ class TokenOrderBook:
             self._last_update_id = last_update_id
 
     def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
-        """Принимает изменения (диффы) из WebSocket
-        Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется."""
+        #Принимает изменения (диффы) из WebSocket
+        #Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется.
         #=============================
         print("apply_deltas.b_deltas: ", bid_deltas) #debug --> to remove after
         print("apply_deltas.a_deltas: ", ask_deltas) #debug --> to remove after
@@ -104,14 +102,14 @@ class TokenOrderBook:
 
     # ---------------- Queries ----------------
     def get_top_levels(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        """Возвращает топ N уровней стакана: bids (самые дорогие), asks (самые дешевые)."""
+        #Возвращает топ N уровней стакана: bids (самые дорогие), asks (самые дешевые).
         with self._lock:
             bids_top = heapq.nlargest(n, self._bids.items(), key=self._price_key) #покупки
             asks_top = heapq.nsmallest(n, self._asks.items(), key=self._price_key)#продажи
             return bids_top, asks_top
         
     def get_dom_snapshot(self, L: int = 50) -> DOMSnapshot:
-        """DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно."""
+        #DOM-снимок: топ-L уровней на сторону + mid/spread, всё потокобезопасно.
         bids, asks = self.get_top_levels(L)
 
         best_bid = bids[0][0] if bids else 0.0
@@ -214,11 +212,11 @@ class TokenOrderBook:
 
     @staticmethod
     def _process_side(levels: List[Tuple[float, float]], impact_usd: float) -> Dict[str, float]:
-        """Вычисляет сумму, стенку, цену воздействия и данные для наклона за ОДИН проход. O(n*log(n))"""
-        """1.Считает суммарный объем в долларах для первых n уровней. Это показатель ликвидности «в моменте»"""
-        """2.Ищет «стенку» — уровень с самым большим объемом в долларах среди первых n. Это потенциальное сопротивление или поддержка."""
-        """3.Оценивает «цену исполнения». Если ты захочешь купить/продать сразу на target_usd, до какой цены ты «прошьешь» стакан? По сути — оценка проскальзывания."""
-        """4.Линейная регрессия показывает «наклон» ликвидности: как быстро растет/падает объем в зависимости от удаления от лучшей цены."""
+        #Вычисляет сумму, стенку, цену воздействия и данные для наклона за ОДИН проход. O(n*log(n))
+        #1.Считает суммарный объем в долларах для первых n уровней. Это показатель ликвидности «в моменте»
+        #2.Ищет «стенку» — уровень с самым большим объемом в долларах среди первых n. Это потенциальное сопротивление или поддержка.
+        #3.Оценивает «цену исполнения». Если ты захочешь купить/продать сразу на target_usd, до какой цены ты «прошьешь» стакан? По сути — оценка проскальзывания.
+        #4.Линейная регрессия показывает «наклон» ликвидности: как быстро растет/падает объем в зависимости от удаления от лучшей цены.
         
         total_usd = 0.0
         max_usd = -1.0
@@ -273,7 +271,8 @@ class TokenOrderBook:
         }
     
     def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
-        """Главный диспетчер. Генерит фичи из данных о стакане"""
+        #Главный диспетчер. Генерит фичи из данных о стакане
+        
         # Получаем данные из стакана (уже отсеченные до n под замком)
         bids, asks = self.get_top_levels(n)
         
@@ -294,16 +293,14 @@ class TokenOrderBook:
             "wall_bid_usd": round(bid_features["wall_usd"], 6),
             "wall_ask_px": ask_features["wall_px"],
             "wall_ask_usd": round(ask_features["wall_usd"], 6),
-            "impact_buy_px": ask_features["impact_px"],  # Покупаем у асков
-            "impact_sell_px": bid_features["impact_px"], # Продаем бидам
+            "impact_buy_px": ask_features["impact_px"],  
+            "impact_sell_px": bid_features["impact_px"]
         }
 
 
 class _SymbolDepthWorker(threading.Thread):
-    """
-    One worker per symbol: REST snapshot + WS diffs, sequence handling, resync.
-    «Рабочий», который отвечает за сетевое взаимодействие для конкретной монеты (подключение к сокету, загрузка снимка, синхронизация).
-    """
+    #One worker per symbol: REST snapshot + WS diffs, sequence handling, resync.
+    #«Рабочий», который отвечает за сетевое взаимодействие для конкретной монеты (подключение к сокету, загрузка снимка, синхронизация).
     daemon = True
 
     def __init__(self, symbol: str, orderbook: TokenOrderBook, session: Optional[requests.Session] = None, *, verbose: bool = False):
@@ -447,10 +444,8 @@ class _SymState:
     last_access_ts: float   # updated ONLY on touch()
 
 class DepthBooksManager:
-    """ 
-    Высокоуровневый интерфейс. Он управляет списком всех отслеживаемых монет и автоматически удаляет те, 
-    которыми давно не интересовались (Auto-eviction).
-    """
+    #Высокоуровневый интерфейс. Он управляет списком всех отслеживаемых монет и автоматически удаляет те, 
+    #которыми давно не интересовались (Auto-eviction).
     def __init__(self, auto_evict_sec: int = AUTO_EVICT_SEC):
         self._states: Dict[str, _SymState] = {}
         self._lock = threading.RLock()
@@ -554,7 +549,6 @@ class DepthBooksManager:
                 out[sym.lower()] = st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
         return out
     
-
 """
 # --------------------------- Minimal self-test ---------------------------
 if __name__ == "__main__":
