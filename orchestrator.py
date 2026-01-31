@@ -7,7 +7,7 @@ import math
 
 from telegram_observer import TelegramObserver
 from ws_ohlcv_manager import StreamManager as AggTrades
-from ws_depth_manager import DepthBooksManager
+from ws_depth_manager import TokenOrderBooksManager
 from ws_depth_sampler import DepthSampler
 from snapshot_packer import SnapshotPacker
 from action_codec import ActionCodec
@@ -33,7 +33,7 @@ class Orchestrator:
         #init data services 
         self._tg = TelegramObserver()
         self._ohlcv = AggTrades()
-        self._depth = DepthBooksManager()
+        self._depth = TokenOrderBooksManager()
 
         #init features services
         self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)

@@ -298,7 +298,7 @@ class TokenOrderBook:
         }
 
 
-class _SymbolDepthWorker(threading.Thread):
+class _TokenOrderBookWorker(threading.Thread):
     #One worker per symbol: REST snapshot + WS diffs, sequence handling, resync.
     #«Рабочий», который отвечает за сетевое взаимодействие для конкретной монеты (подключение к сокету, загрузка снимка, синхронизация).
     daemon = True
@@ -440,10 +440,10 @@ class _SymbolDepthWorker(threading.Thread):
 @dataclass
 class _SymState:
     book: TokenOrderBook
-    worker: _SymbolDepthWorker
+    worker: _TokenOrderBookWorker
     last_access_ts: float   # updated ONLY on touch()
 
-class DepthBooksManager:
+class TokenOrderBooksManager:
     #Высокоуровневый интерфейс. Он управляет списком всех отслеживаемых монет и автоматически удаляет те, 
     #которыми давно не интересовались (Auto-eviction).
     def __init__(self, auto_evict_sec: int = AUTO_EVICT_SEC):
@@ -466,7 +466,7 @@ class DepthBooksManager:
                 return
             book = TokenOrderBook(sym_u)
             print(f"🚀 Starting Depth stream for {sym_u}")
-            worker = _SymbolDepthWorker(sym_l, book, session=self._session)
+            worker = _TokenOrderBookWorker(sym_l, book, session=self._session)
             self._states[sym_l] = _SymState(book=book, worker=worker, last_access_ts=now)
             worker.start()
 
