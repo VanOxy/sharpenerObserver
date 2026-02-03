@@ -4,7 +4,6 @@ import requests
 from websocket import WebSocketApp
 import threading
 import time
-import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, TypedDict
 from operator import itemgetter
@@ -15,7 +14,6 @@ import orjson
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 BINANCE_FUTURES_API = "https://fapi.binance.com"
 REST_DEPTH_LIMIT = 1000
-WS_INTERVAL = "250ms"
 CONNECT_TIMEOUT = 10
 HTTP_TIMEOUT = 5
 
@@ -261,7 +259,7 @@ class _TokenOrderBookWorker(threading.Thread):
         try:
             if '"depthUpdate"' not in message: 
                 return
-
+            
             data = orjson.loads(message)
 
             if not self._is_synced:     # Состояние SYNCING: просто копим в буфер
@@ -310,7 +308,7 @@ class _TokenOrderBookWorker(threading.Thread):
         self._buffer = []
         self._prev_u = 0
         
-        ws_url = f"{BINANCE_FUTURES_WS}/{self.symbol}@depth@{WS_INTERVAL}"
+        ws_url = f"{BINANCE_FUTURES_WS}/{self.symbol}@depth"
         self._ws = WebSocketApp(
             ws_url,
             on_message=self._on_message,
