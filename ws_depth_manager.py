@@ -2,7 +2,6 @@
 from config import Config
 import requests
 from websocket import WebSocketApp
-import json
 import threading
 import time
 import traceback
@@ -10,12 +9,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, TypedDict
 from operator import itemgetter
 import heapq
+import orjson
 
 # --- Config ---
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 BINANCE_FUTURES_API = "https://fapi.binance.com"
 REST_DEPTH_LIMIT = 1000
-WS_INTERVAL = "500ms"
+WS_INTERVAL = "250ms"
 CONNECT_TIMEOUT = 10
 HTTP_TIMEOUT = 5
 
@@ -82,22 +82,17 @@ class TokenOrderBook:
     def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
         #Принимает изменения (диффы) из WebSocket
         #Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется.
-        #=============================
-        print("apply_deltas.b_deltas: ", bid_deltas) #debug --> to remove after
-        print("apply_deltas.a_deltas: ", ask_deltas) #debug --> to remove after
-        #=============================
-
         prepared_bids = [self._parse_price_qty(price, qty) for price, qty in bid_deltas]
         prepared_asks = [self._parse_price_qty(price, qty) for price, qty in ask_deltas]
 
         with self._lock:
-            for p, q in prepared_bids:
-                if q == 0: self._bids.pop(p, None)
-                else: self._bids[p] = q
+            for price, qty in prepared_bids:
+                if qty == 0: self._bids.pop(price, None)
+                else: self._bids[price] = qty
 
-            for p, q in prepared_asks:
-                if q == 0: self._asks.pop(p, None)
-                else: self._asks[p] = q
+            for price, qty in prepared_asks:
+                if qty == 0: self._asks.pop(price, None)
+                else: self._asks[price] = qty
 
             self._last_update_id = last_update_id
 
@@ -133,83 +128,6 @@ class TokenOrderBook:
                 for px, qty in asks
             ],
         }
-
-    """
-    @staticmethod
-    def _sum_top_n_usd(levels: List[Tuple[float, float]], n: int) -> Tuple[float, List[Tuple[float, float]]]:
-        used = levels[:n]
-        total = 0.0
-        for p, q in used:
-            total += p * q
-        return total, used
-
-    @staticmethod
-    def _wall_by_usd(levels: List[Tuple[float, float]], n: int) -> Tuple[float, float, float]:
-        best_p, best_q, best_usd = 0.0, 0.0, -1.0
-        for p, q in levels[:n]:
-            usd = p * q
-            if usd > best_usd:
-                best_usd = usd
-                best_p, best_q = p, q
-        return best_p, best_q, best_usd
-
-    @staticmethod
-    def _impact_price_usd(levels: List[Tuple[float, float]], target_usd: float) -> float:
-        if not levels or target_usd <= 0:
-            return 0.0
-        acc = 0.0
-        for p, q in levels:
-            lvl_usd = p * q
-            if acc + lvl_usd >= target_usd and lvl_usd > 0:
-                return p
-            acc += lvl_usd
-        return levels[-1][0]
-
-    @staticmethod
-    def _slope_usd(levels: List[Tuple[float, float]], n: int) -> float:
-        m = min(len(levels), n)
-        if m <= 1:
-            return 0.0
-        xs = list(range(m))
-        ys = [p * q for (p, q) in levels[:m]]
-        mean_x = sum(xs) / m
-        mean_y = sum(ys) / m
-        num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        den = sum((x - mean_x) ** 2 for x in xs) or 1.0
-        return num / den
-
-    def get_features_usd(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]: #unoptimized version
-        bids, asks = self.get_top_levels(n)
-
-        sum_bid_usd, used_bids = self._sum_top_n_usd(bids, n)
-        sum_ask_usd, used_asks = self._sum_top_n_usd(asks, n)
-
-        total = sum_bid_usd + sum_ask_usd
-        cum_imbalance = ((sum_bid_usd - sum_ask_usd) / total) if total > 0 else 0.0
-
-        wall_bid_px, _, wall_bid_usd = self._wall_by_usd(used_bids, n)
-        wall_ask_px, _, wall_ask_usd = self._wall_by_usd(used_asks, n)
-
-        impact_buy_px = self._impact_price_usd(used_asks, impact_usdt)   # buy -> asks
-        impact_sell_px = self._impact_price_usd(used_bids, impact_usdt)  # sell -> bids
-
-        slope_bid = self._slope_usd(used_bids, n)
-        slope_ask = self._slope_usd(used_asks, n)
-
-        return {
-            "sum_bid_n_usd": round(sum_bid_usd, 6),
-            "sum_ask_n_usd": round(sum_ask_usd, 6),
-            "cum_imbalance_n_usd": float(cum_imbalance),
-            "slope_bid_n_usd": float(slope_bid),
-            "slope_ask_n_usd": float(slope_ask),
-            "wall_bid_px": float(wall_bid_px),
-            "wall_bid_usd": round(float(wall_bid_usd), 6),
-            "wall_ask_px": float(wall_ask_px),
-            "wall_ask_usd": round(float(wall_ask_usd), 6),
-            "impact_buy_px": float(impact_buy_px),
-            "impact_sell_px": float(impact_sell_px),
-        }
-    """
 
     @staticmethod
     def _process_side(levels: List[Tuple[float, float]], impact_usd: float) -> Dict[str, float]:
@@ -314,144 +232,171 @@ class TokenOrderBook:
 class _TokenOrderBookWorker(threading.Thread):
     #One worker per symbol: REST snapshot + WS diffs, sequence handling, resync.
     #«Рабочий», который отвечает за сетевое взаимодействие для конкретной монеты (подключение к сокету, загрузка снимка, синхронизация).
-    daemon = True
-
-    def __init__(self, symbol: str, orderbook: TokenOrderBook, session: Optional[requests.Session] = None, *, verbose: bool = False):
-        super().__init__(name=f"DepthWorker-{symbol.upper()}")
+    def __init__(self, symbol: str, orderbook: TokenOrderBook, session: Optional[requests.Session] = None, verbose: bool = False):
+        super().__init__(name=f"OrderBookWorker-{symbol.upper()}", daemon=True)
         self.symbol = symbol.lower()
         self.sym_u = symbol.upper()
         self.book = orderbook
-        self._stop = threading.Event()
-        self._ws: Optional[WebSocketApp] = None
-        self._session = session or requests.Session()
-        self._buffer: List[Dict] = []
-        self._buffer_lock = threading.Lock()
-        self._connected = threading.Event()
         self._verbose = verbose
+        self._session = session or requests.Session()
+
+        self._stop_event = threading.Event() 
+        self._is_synced = False     # "флаг-переключатель" -> после API снэпшота идут WS диффы
+
+        self._buffer_lock = threading.Lock()
+        self._buffer: List[Dict] = []
+        self._prev_u: int = 0
+
+        self._ws: Optional[WebSocketApp] = None
 
     def stop(self):
-        self._stop.set()
-        try:
-            if self._ws:
+        self._stop_event.set()
+        if self._ws:
+            try:
                 self._ws.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+    def _on_message(self, ws, message: str):
+        try:
+            if '"depthUpdate"' not in message: 
+                return
+
+            data = orjson.loads(message)
+
+            if not self._is_synced:     # Состояние SYNCING: просто копим в буфер
+                with self._buffer_lock:
+                    self._buffer.append(data)
+            else:                       # Состояние LIVE: применяем мгновенно
+                self._process_event(data)
+
+        except Exception as e:
+            self._handle_error(f"OnMessage Error: {e}")
+
+    def _process_event(self, evt: Dict, is_first_after_sync: bool = False):
+        """Проверка последовательности и применение дельты."""
+        u = int(evt["u"])               #finalUpdateId
+        pu = int(evt.get("pu", -1))     #prevFinalUpdateId --> should be (u - 1)
+
+        if not is_first_after_sync:
+            if self._prev_u != 0 and pu != self._prev_u:
+                self._handle_error(f"Data gap detected! Expected pu={self._prev_u} -> but got pu={pu}")
+                return
+
+        # Накатываем изменения
+        self.book.apply_deltas(evt["b"], evt["a"], u) 
+        self._prev_u = u    #Запоминаем текущий u как "предыдущий" для следующего сообщения
+
+    def _handle_error(self, reason: str):
+        if self._verbose:
+            print(f"[{self.name}] {reason}")
+        self._is_synced = False
+        if self._ws:
+            self._ws.close() # Это спровоцирует перезапуск в run()
 
     def run(self):
-        while not self._stop.is_set():
+        """Основной цикл жизни воркера."""
+        while not self._stop_event.is_set():
             try:
-                self._run_once()
+                self._establish_connection()
             except Exception as e:
                 if self._verbose:
-                    print(f"[{self.name}] restart due to: {e}")
-                time.sleep(0.25)
+                    print(f"[{self.name}] Connection failed: {e}. Retry in 1s...")
+                time.sleep(1)
 
-    def _run_once(self):
+    def _establish_connection(self):
+        """Логика запуска и синхронизации."""
+        self._is_synced = False
+        self._buffer = []
+        self._prev_u = 0
+        
         ws_url = f"{BINANCE_FUTURES_WS}/{self.symbol}@depth@{WS_INTERVAL}"
-        with self._buffer_lock:
-            self._buffer = []
-        self._connected.clear()
+        self._ws = WebSocketApp(
+            ws_url,
+            on_message=self._on_message,
+            on_error=lambda ws, e: print(f"WS Error: {e}"),
+            on_close=lambda ws, c, r: print("WS Closed")
+        )
 
-        def on_open(ws):
-            self._connected.set()
+        # Запускаем WS в текущем потоке воркера (через run_forever)
+        # Нам не нужен отдельный ws_thread, так как run() уже в своем потоке!
+        # Но чтобы выполнить синхронизацию ПАРАЛЛЕЛЬНО приему данных, 
+        # нам нужно запустить синхронизацию в отдельном маленьком потоке
+        threading.Thread(target=self._sync_sequence, daemon=True).start()
+        
+        self._ws.run_forever(ping_interval=15, ping_timeout=10)
 
-        def on_message(ws, message: str):
-            try:
-                evt = json.loads(message)
-                if evt.get("e") != "depthUpdate":
-                    return
+    def _sync_sequence(self):
+        """Фоновая синхронизация с логикой ожидания стрима.Run once on init, or later on reconnect if traffic lags accured"""
+        try:
+            # 1. Ждем, пока WebSocket вообще начнет получать данные (проверка жизни)
+            for _ in range(50): 
+                if self._buffer: break
+                time.sleep(0.1) 
+
+            if not self._buffer:
+                raise Exception("WebSocket is not receiving data (buffer empty).")
+            
+            # 2. Получаем REST Snapshot
+            snap = self._get_rest_snapshot()
+            last_id = snap["lastUpdateId"]
+            
+            # 3. ЛОГИКА ДОГОНЯЛОК: Ждем, пока WebSocket добежит до ID снимка
+            # Даем стриму до 5 секунд, чтобы он прислал нужный ID
+            start_wait = time.time()
+            caught_up = False
+            while time.time() - start_wait < 5.0:
                 with self._buffer_lock:
-                    self._buffer.append(evt)
-            except Exception:
-                if self._verbose:
-                    traceback.print_exc()
+                    if self._buffer and int(self._buffer[-1]["u"]) >= last_id:
+                        caught_up = True
+                        break
+                time.sleep(0.1)
 
-        def on_error(ws, err):
-            raise RuntimeError(f"WS error: {err}")
+            if not caught_up:
+                raise Exception(f"WebSocket is lagging. Stream max ID < Snapshot ID ({last_id})")
+            
+            # 4. Стыковка
+            with self._buffer_lock:
+                # Загружаем в книгу
+                self.book.load_snapshot(snap["bids"], snap["asks"], last_id)
+                self._prev_u = last_id
 
-        def on_close(ws, code, reason):
-            pass
+                found_bridge = False 
+                for evt in self._buffer:
+                    u = int(evt["u"])   #finalUpdateId
+                    U = int(evt["U"])   #firstUpdateId
+                    
+                    if U <= last_id <= u:
+                        # ПЕРВЫЙ пакет (мост) - передаем True
+                        self._process_event(evt, is_first_after_sync=True)
+                        found_bridge = True
+                    elif found_bridge:
+                        # Все последующие события просто накатываем по цепочке
+                        self._process_event(evt, is_first_after_sync=False)
+                
+                if not found_bridge:
+                    # Если мы здесь, значит Snapshot ID оказался МЕНЬШЕ, чем самое старое событие в буфере
+                    raise Exception(f"Sync Bridge not found. Snapshot is too OLD (Buffer starts after Snapshot).")
+                
+                self._buffer = []
+                self._is_synced = True # ПЕРЕКЛЮЧАТЕЛЬ: теперь on_message работает LIVE
+                
+            if self._verbose:
+                print(f"[{self.name}] Sync successful. Mode: LIVE. LastId: {last_id}")
+                
+        except Exception as e:
+            self._handle_error(f"Sync failed: {e}")
 
-        self._ws = WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
-        ws_thread = threading.Thread(target=self._ws.run_forever, kwargs={"ping_interval": 15, "ping_timeout": 10}, daemon=True)
-        ws_thread.start()
-
-        if not self._connected.wait(CONNECT_TIMEOUT):
-            raise RuntimeError("WS connect timeout")
-
-        snap = self._rest_snapshot()
-        last_update_id = snap["lastUpdateId"]
-        self.book.load_snapshot(snap["bids"], snap["asks"], last_update_id)
-
-        batch = self._drain_buffer()
-        start_idx = -1
-        for i, evt in enumerate(batch):
-            U = int(evt.get("U", 0))
-            u = int(evt.get("u", 0))
-            if U <= last_update_id + 1 <= u:
-                start_idx = i
-                break
-        if start_idx == -1:
-            self._hard_resync()
-            return
-
-        prev_u = last_update_id
-        for evt in batch[start_idx:]:
-            if not self._apply_if_sequential(evt, prev_u):
-                self._hard_resync()
-                return
-            prev_u = int(evt["u"])
-
-        while not self._stop.is_set():
-            live = self._drain_buffer()
-            for evt in live:
-                if not self._apply_if_sequential(evt, prev_u):
-                    self._hard_resync()
-                    return
-                prev_u = int(evt["u"])
-            time.sleep(0.5)
-
-    def _rest_snapshot(self) -> Dict:
+    def _get_rest_snapshot(self) -> Dict:
         url = f"{BINANCE_FUTURES_API}/fapi/v1/depth"
         params = {"symbol": self.sym_u, "limit": REST_DEPTH_LIMIT}
         r = self._session.get(url, params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json()
 
-    def _drain_buffer(self) -> List[Dict]:
-        with self._buffer_lock:
-            batch = self._buffer
-            self._buffer = []
-            return batch
-
-    def _apply_if_sequential(self, evt: Dict, prev_u: int) -> bool:
-        try:
-            U = int(evt.get("U", 0))
-            u = int(evt.get("u", 0))
-            pu = evt.get("pu")
-            contiguous = (int(pu) == prev_u) if (pu is not None) else (U == prev_u + 1)
-            if not contiguous:
-                return False
-            self.book.apply_deltas(evt.get("b", []), evt.get("a", []), u)
-            return True
-        except Exception:
-            if self._verbose:
-                traceback.print_exc()
-            return False
-
-    def _hard_resync(self):
-        try:
-            if self._ws:
-                self._ws.close()
-        except Exception:
-            pass
-        time.sleep(0.25)
-        raise RuntimeError("Resync required — restarting WS + snapshot")
-
-
 # ------- per-symbol state for manager -------
 @dataclass
-class _SymState:
+class _TokenState:
     book: TokenOrderBook
     worker: _TokenOrderBookWorker
     last_access_ts: float   # updated ONLY on touch()
@@ -460,7 +405,7 @@ class TokenOrderBooksManager:
     #Высокоуровневый интерфейс. Он управляет списком всех отслеживаемых монет и автоматически удаляет те, 
     #которыми давно не интересовались (Auto-eviction).
     def __init__(self, auto_evict_sec: int = AUTO_EVICT_SEC):
-        self._states: Dict[str, _SymState] = {}
+        self._states: Dict[str, _TokenState] = {}
         self._lock = threading.RLock()
         self._session = requests.Session()
         self._stop = threading.Event()
@@ -480,7 +425,7 @@ class TokenOrderBooksManager:
             book = TokenOrderBook(sym_u)
             print(f"🚀 Starting Depth stream for {sym_u}")
             worker = _TokenOrderBookWorker(sym_l, book, session=self._session)
-            self._states[sym_l] = _SymState(book=book, worker=worker, last_access_ts=now)
+            self._states[sym_l] = _TokenState(book=book, worker=worker, last_access_ts=now)
             worker.start()
 
     def start(self):
@@ -611,3 +556,45 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         mgr.stop()
 """
+
+if __name__ == "__main__":
+    # 1. Создаем объект стакана для BTC
+    btc_book = TokenOrderBook("BTCUSDT") 
+    
+    # 2. Создаем воркера
+    # Параметр verbose=True поможет нам видеть логи синхронизации
+    worker = _TokenOrderBookWorker(
+        symbol="BTCUSDT", 
+        orderbook=btc_book, 
+        verbose=True
+    )
+
+    print("🚀 Запуск воркера... Ждем синхронизации (около 2 сек)...")
+    worker.start()
+
+    try:
+        # 3. Цикл мониторинга
+        while True:
+            time.sleep(1) # Раз в секунду выводим данные
+            
+            # Если стакан еще не синхронизирован, пропускаем
+            if not worker._is_synced:
+                continue
+                
+            # Получаем фичи (impact на 10,000 USDT)
+            stats = btc_book.get_features_usd(n=100, impact_usdt=10_000)
+            
+            # Красивый вывод в консоль
+            print("-" * 50)
+            print(f"SYMBOL: BTCUSDT | LIVE DATA")
+            print(f"Mid Price: {stats['mid_price']:.2f} | Spread: {stats['rel_spread_bps']:.2f} bps")
+            print(f"Imbalance: {stats['cum_imbalance_n_usd']:.2%}")
+            print(f"Slopes: Bid {stats['slope_bid_n_usd']:.4f} | Ask {stats['slope_ask_n_usd']:.4f}")
+            print(f"Walls: Buy {stats['wall_bid_px']} ({stats['wall_bid_usd']:.0f} USD) | "
+                  f"Sell {stats['wall_ask_px']} ({stats['wall_ask_usd']:.0f} USD)")
+            
+    except KeyboardInterrupt:
+        print("\n🛑 Останавливаем воркер...")
+        worker.stop()
+        worker.join()
+        print("✅ Тест завершен.")
