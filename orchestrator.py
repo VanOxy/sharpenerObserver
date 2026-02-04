@@ -114,7 +114,7 @@ class Orchestrator:
                 # get data
                 bars = self._ohlcv.get_all_last_bars() 
                 t0 = orch_prof.lap(t0, "bars")               #profiling
-                dom_all = self._depth.get_all_dom(L=50) 
+                dom_all = self._depth.get_all_doms(L=100) 
                 t0 = orch_prof.lap(t0, "dom")                #profiling
                 feats = self._depth.get_all_features()
                 t0 = orch_prof.lap(t0, "feats")              #profiling

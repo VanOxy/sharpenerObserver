@@ -19,7 +19,7 @@ HTTP_TIMEOUT = 5
 
 # --- Manager params ---
 AUTO_EVICT_SEC = Config.TTL_SECONDS
-GC_INTERVAL_SEC = 1
+GC_INTERVAL_SEC = 10
 
 class DOMLevel(TypedDict):
     px: float
@@ -388,9 +388,9 @@ class _TokenOrderBookWorker(threading.Thread):
     def _get_rest_snapshot(self) -> Dict:
         url = f"{BINANCE_FUTURES_API}/fapi/v1/depth"
         params = {"symbol": self.sym_u, "limit": REST_DEPTH_LIMIT}
-        r = self._session.get(url, params=params, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
+        response = self._session.get(url, params=params, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
 
 # ------- per-symbol state for manager -------
 @dataclass
@@ -406,25 +406,34 @@ class TokenOrderBooksManager:
         self._states: Dict[str, _TokenState] = {}
         self._lock = threading.RLock()
         self._session = requests.Session()
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._auto_evict_sec = int(auto_evict_sec)
         self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True, name="DepthGC")
 
     # ---------------- Lifecycle ----------------
     def touch(self, symbol: str) -> None:
+        """
+        Гарантирует, что воркер для символа запущен. 
+        Если уже запущен — обновляет время доступа (TTL).
+        """
         sym_l = symbol.lower()
         sym_u = symbol.upper()
         now = time.time()
+
         with self._lock:
-            st = self._states.get(sym_l)
-            if st is not None:
-                st.last_access_ts = now  # TTL продлеваем ТОЛЬКО здесь
+            tokenState = self._states.get(sym_l)
+            if tokenState is not None:
+                tokenState.last_access_ts = now
                 return
-            book = TokenOrderBook(sym_u)
-            print(f"🚀 Starting Depth stream for {sym_u}")
-            worker = _TokenOrderBookWorker(sym_l, book, session=self._session)
-            self._states[sym_l] = _TokenState(book=book, worker=worker, last_access_ts=now)
-            worker.start()
+            
+            try:
+                print(f"🚀 Starting Depth stream for {sym_u}")
+                book = TokenOrderBook(sym_u)
+                worker = _TokenOrderBookWorker(sym_l, book, session=self._session)
+                self._states[sym_l] = _TokenState(book=book, worker=worker, last_access_ts=now)
+                worker.start()
+            except Exception as e:
+                print(f"❌ Failed to start worker for {sym_u}: {e}")
 
     def start(self):
         self._gc_thread.start()
@@ -432,42 +441,42 @@ class TokenOrderBooksManager:
     def stop(self, symbol: Optional[str] = None) -> None:
         with self._lock:
             if symbol is None:
-                for st in list(self._states.values()):
-                    st.worker.stop()
+                for state in list(self._states.values()):
+                    state.worker.stop()
                 self._states.clear()
-                self._stop.set()
+                self._stop_event.set()
                 return
             sym_l = symbol.lower()
-            st = self._states.pop(sym_l, None)
-            if st:
-                st.worker.stop()
+            state = self._states.pop(sym_l, None)
+            if state:
+                state.worker.stop()
 
-    # ---------------- GC / авто-эвикшн ----------------
+    # ---------------- GC / Auto-eviction ----------------
     def _gc_loop(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             time.sleep(GC_INTERVAL_SEC)
-            if self._auto_evict_sec <= 0:
-                continue
+            if self._auto_evict_sec <= 0: continue
+
             deadline = time.time() - self._auto_evict_sec
             expired: List[str] = []
             with self._lock:
-                for sym, st in list(self._states.items()):
-                    if st.last_access_ts < deadline:
+                for token, state in list(self._states.items()):
+                    if state.last_access_ts < deadline:
                         try:
-                            st.worker.stop()
+                            state.worker.stop()
                         except Exception:
                             pass
-                        expired.append(sym)
-                        del self._states[sym]
-            for sym in expired:
-                print(f"⏹️ Depth GC: stopped {sym.upper()} (idle > {self._auto_evict_sec}s)")
+                        expired.append(token)
+                        del self._states[token]
+                        print(f"⏹️ Depth GC: stopped {token.upper()} (idle > {self._auto_evict_sec}s)")
 
     # ---------------- Queries (без продления TTL) ----------------
     def list_symbols(self) -> List[str]:
         with self._lock:
             return list(self._states.keys())
 
-    def get_dom_snapshot(self, symbol: str, L: int = 20) -> Dict[str, object]:
+    def get_dom_snapshot(self, symbol: str, L: int = 100) -> Dict[str, object]:
+        #снэп стакана для токена в параметрах
         sym_l = symbol.lower()
         with self._lock:
             st = self._states.get(sym_l)
@@ -475,7 +484,8 @@ class TokenOrderBooksManager:
                 return {}
             return st.book.get_dom_snapshot(L=L)
 
-    def get_all_dom(self, L: int = 20, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, object]]:
+    def get_all_doms(self, L: int = 100, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, object]]:
+        #снэп всех стаканов 
         out: Dict[str, Dict[str, object]] = {}
         with self._lock:
             keys = [s.lower() for s in (symbols or self._states.keys())]
@@ -487,6 +497,7 @@ class TokenOrderBooksManager:
         return out
 
     def get_features(self, symbol: str, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
+        #фичи стакана токена в параметрах
         sym_l = symbol.lower()
         with self._lock:
             st = self._states.get(sym_l)
@@ -495,6 +506,7 @@ class TokenOrderBooksManager:
             return st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
 
     def get_all_features(self, n: int = 100, impact_usdt: float = 10_000, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
+        #фичи всех стаканов
         out: Dict[str, Dict[str, float]] = {}
         with self._lock:
             keys = [s.lower() for s in (symbols or self._states.keys())]
@@ -554,7 +566,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         mgr.stop()
 """
-
+"""
 if __name__ == "__main__":
     # 1. Создаем объект стакана для BTC
     btc_book = TokenOrderBook("BTCUSDT") 
@@ -596,3 +608,4 @@ if __name__ == "__main__":
         worker.stop()
         worker.join()
         print("✅ Тест завершен.")
+"""
