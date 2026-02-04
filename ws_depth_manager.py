@@ -227,7 +227,7 @@ class TokenOrderBook:
         }
 
 
-class _TokenOrderBookWorker(threading.Thread):
+class TokenOrderBookWorker(threading.Thread):
     #One worker per symbol: REST snapshot + WS diffs, sequence handling, resync.
     #«Рабочий», который отвечает за сетевое взаимодействие для конкретной монеты (подключение к сокету, загрузка снимка, синхронизация).
     def __init__(self, symbol: str, orderbook: TokenOrderBook, session: Optional[requests.Session] = None, verbose: bool = False):
@@ -394,16 +394,17 @@ class _TokenOrderBookWorker(threading.Thread):
 
 # ------- per-symbol state for manager -------
 @dataclass
-class _TokenState:
+class TokenState:
     book: TokenOrderBook
-    worker: _TokenOrderBookWorker
+    worker: TokenOrderBookWorker
     last_access_ts: float   # updated ONLY on touch()
+
 
 class TokenOrderBooksManager:
     #Высокоуровневый интерфейс. Он управляет списком всех отслеживаемых монет и автоматически удаляет те, 
     #которыми давно не интересовались (Auto-eviction).
     def __init__(self, auto_evict_sec: int = AUTO_EVICT_SEC):
-        self._states: Dict[str, _TokenState] = {}
+        self._states: Dict[str, TokenState] = {}
         self._lock = threading.RLock()
         self._session = requests.Session()
         self._stop_event = threading.Event()
@@ -411,11 +412,8 @@ class TokenOrderBooksManager:
         self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True, name="DepthGC")
 
     # ---------------- Lifecycle ----------------
-    def touch(self, symbol: str) -> None:
-        """
-        Гарантирует, что воркер для символа запущен. 
-        Если уже запущен — обновляет время доступа (TTL).
-        """
+    def touch(self, symbol: str) -> bool:
+        #Гарантирует, что воркер для символа запущен. Если уже запущен — обновляет время доступа (TTL).
         sym_l = symbol.lower()
         sym_u = symbol.upper()
         now = time.time()
@@ -424,32 +422,34 @@ class TokenOrderBooksManager:
             tokenState = self._states.get(sym_l)
             if tokenState is not None:
                 tokenState.last_access_ts = now
-                return
+                return True
             
             try:
                 print(f"🚀 Starting Depth stream for {sym_u}")
                 book = TokenOrderBook(sym_u)
-                worker = _TokenOrderBookWorker(sym_l, book, session=self._session)
-                self._states[sym_l] = _TokenState(book=book, worker=worker, last_access_ts=now)
+                worker = TokenOrderBookWorker(sym_l, book, session=self._session, verbose=True)
+                self._states[sym_l] = TokenState(book=book, worker=worker, last_access_ts=now)
                 worker.start()
+                return True
             except Exception as e:
                 print(f"❌ Failed to start worker for {sym_u}: {e}")
+                return False
 
     def start(self):
         self._gc_thread.start()
 
     def stop(self, symbol: Optional[str] = None) -> None:
         with self._lock:
-            if symbol is None:
-                for state in list(self._states.values()):
+            if symbol is None: # stop_all
+                for state in self._states.values():
                     state.worker.stop()
                 self._states.clear()
                 self._stop_event.set()
                 return
+            #stop token 
             sym_l = symbol.lower()
             state = self._states.pop(sym_l, None)
-            if state:
-                state.worker.stop()
+            if state: state.worker.stop()
 
     # ---------------- GC / Auto-eviction ----------------
     def _gc_loop(self):
@@ -458,69 +458,68 @@ class TokenOrderBooksManager:
             if self._auto_evict_sec <= 0: continue
 
             deadline = time.time() - self._auto_evict_sec
-            expired: List[str] = []
             with self._lock:
                 for token, state in list(self._states.items()):
                     if state.last_access_ts < deadline:
+                        print(f"⏹️ Depth GC: stopped {token.upper()} due to inactivity...")
                         try:
                             state.worker.stop()
-                        except Exception:
+                            del self._states[token]
+                        except Exception as e:
+                            print("Error on GC stop (TTL eviction failed):", e)
                             pass
-                        expired.append(token)
-                        del self._states[token]
-                        print(f"⏹️ Depth GC: stopped {token.upper()} (idle > {self._auto_evict_sec}s)")
 
-    # ---------------- Queries (без продления TTL) ----------------
-    def list_symbols(self) -> List[str]:
-        with self._lock:
-            return list(self._states.keys())
-
-    def get_dom_snapshot(self, symbol: str, L: int = 100) -> Dict[str, object]:
-        #снэп стакана для токена в параметрах
-        sym_l = symbol.lower()
-        with self._lock:
-            st = self._states.get(sym_l)
-            if not st:
-                return {}
-            return st.book.get_dom_snapshot(L=L)
-
-    def get_all_doms(self, L: int = 100, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, object]]:
-        #снэп всех стаканов 
+    # ---------------- Queries ----------------
+    def get_all_doms(self, n: int = 100, tokens: Optional[List[str]] = None) -> Dict[str, Dict[str, object]]:
+        #снэп всех стаканов(default), можно передать список токенов
         out: Dict[str, Dict[str, object]] = {}
+        current_time = time.time()
+
+        # 1. Быстро забираем список нужных нам объектов воркеров
         with self._lock:
-            keys = [s.lower() for s in (symbols or self._states.keys())]
-            for sym in keys:
-                st = self._states.get(sym)
-                if not st:
-                    continue
-                out[sym.lower()] = st.book.get_dom_snapshot(L=L)
+            if tokens:
+                # Фильтруем только те, что есть в наличии
+                target_states = [(s.upper(), self._states.get(s.lower())) for s in tokens]
+                target_states = [(token, state) for token, state in target_states if state]
+            else:
+                target_states = [(token.upper(), state) for token, state in self._states.items()]
+
+        # 2. Выполняем тяжелое копирование данных ВНЕ лока менеджера
+        for token, state in target_states:
+            # Безопасность: пропускаем, если данных еще нет
+            if not state.worker._is_synced:
+                continue
+            
+            dom = state.book.get_dom_snapshot(L=n)
+            dom['timestamp'] = current_time # Полезно знать, когда сделан слепок
+            out[token] = dom
+            
         return out
 
-    def get_features(self, symbol: str, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, float]:
-        #фичи стакана токена в параметрах
-        sym_l = symbol.lower()
+    def get_all_market_data(self, n: int = 100, impact_usdt: float = 10_000) -> Dict[str, Dict]:
+        # ГЛАВНЫЙ МЕТОД ДЛЯ ОРКЕСТРАТОРА. Собирает фичи по ВСЕМ активным монетам за один проход
+        snapshot = {}
+        current_time = time.time()
+        
         with self._lock:
-            st = self._states.get(sym_l)
-            if not st:
-                return {}
-            return st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
-
-    def get_all_features(self, n: int = 100, impact_usdt: float = 10_000, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
-        #фичи всех стаканов
-        out: Dict[str, Dict[str, float]] = {}
-        with self._lock:
-            keys = [s.lower() for s in (symbols or self._states.keys())]
-            for sym in keys:
-                st = self._states.get(sym)
-                if not st:
-                    continue
-                out[sym.lower()] = st.book.get_features_usd(n=n, impact_usdt=impact_usdt)
-        return out
+            active_tokens = list(self._states.items())
+            
+        for token, state in active_tokens:
+            # Если воркер еще не синхронизировался (нет данных), пропускаем
+            if not state.worker._is_synced: continue
+                
+            # Получаем фичи из книги
+            features = state.book.get_features_usd(n=n, impact_usdt=impact_usdt)
+            features['timestamp'] = current_time    # Добавляем метку времени для контроля актуальности
+            snapshot[token.upper()] = features
+            
+        return snapshot
     
-"""
+"""    
 # --------------------------- Minimal self-test ---------------------------
+#test TokenOrderBooksManager (1)
 if __name__ == "__main__":
-    mgr = DepthBooksManager(AUTO_EVICT_SEC)
+    mgr = TokenOrderBooksManager(AUTO_EVICT_SEC)
     mgr.touch("btcusdt")
     print("✅Started depth workers for BTC. Gathering data for ~2s...")
 
@@ -544,22 +543,16 @@ if __name__ == "__main__":
         mgr.touch("REZUSDT")
         print("✅Started depth workers for rez. Gathering data for ~2s...")
 
-    def PORT3USDT():
-        time.sleep(8.0)
-        mgr.touch("PORT3USDT")
-        print("✅Started depth workers for port3. Gathering data for ~2s...")
 
-
-    # threading.Thread(target=bnb, daemon=True).start()
-    # threading.Thread(target=eth, daemon=True).start()
-    # threading.Thread(target=AVAAIUSDT, daemon=True).start()
-    # threading.Thread(target=REZUSDT, daemon=True).start()
-    # threading.Thread(target=PORT3USDT, daemon=True).start()
+    threading.Thread(target=bnb, daemon=True).start()
+    threading.Thread(target=eth, daemon=True).start()
+    threading.Thread(target=AVAAIUSDT, daemon=True).start()
+    threading.Thread(target=REZUSDT, daemon=True).start()
 
     try:
         while True:
-            #batch = mgr.get_all_features(n=1000, impact_usdt=10_000)
-            batch = mgr.get_all_dom()
+            batch = mgr.get_all_doms()
+            #batch = mgr.get_all_market_data()
             print(batch)
             time.sleep(1)
             
@@ -567,6 +560,34 @@ if __name__ == "__main__":
         mgr.stop()
 """
 """
+#test TokenOrderBooksManager (2)
+if __name__ == "__main__":
+    manager = TokenOrderBooksManager(auto_evict_sec=60)
+    
+    # Список из 20 монет (пример)
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT"]
+    
+    for s in symbols:
+        manager.touch(s)
+        
+    try:
+        while True:
+            # Вот так будет работать оркестратор:
+            data = manager.get_all_market_data(n=100)
+            
+            print(f"--- Snapshot at {time.strftime('%H:%M:%S')} ---")
+            print(f"Active workers: {len(data)} / {len(symbols)}")
+            
+            for sym, feats in data.items():
+                print(f"{sym}: Price {feats['mid_price']:.2f} | Imb: {feats['cum_imbalance_n_usd']:.2%}")
+                
+            time.sleep(1) # Тот самый секундный интервал
+    except KeyboardInterrupt:
+        manager.stop()
+"""
+
+"""
+#test _TokenOrderBookWorker
 if __name__ == "__main__":
     # 1. Создаем объект стакана для BTC
     btc_book = TokenOrderBook("BTCUSDT") 
