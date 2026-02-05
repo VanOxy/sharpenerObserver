@@ -6,7 +6,7 @@ import time
 import math
 
 from telegram_observer import TelegramObserver
-from ws_ohlcv_manager import StreamManager as AggTrades
+from ws_ohlcv_manager import StreamManager as AggTradesManager
 from ws_depth_manager import TokenOrderBooksManager
 from snapshot_packer import SnapshotPacker
 from action_codec import ActionCodec
@@ -31,12 +31,11 @@ class Orchestrator:
 
         #init data services 
         self._tg = TelegramObserver()
-        self._ohlcv = AggTrades()
+        self._ohlcv = AggTradesManager()
         self._depth = TokenOrderBooksManager()
 
         #init features services
         self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)
-        #self.sampler = DepthSampler(top_n=40, tail_bins=32, tail_max_bps=50.0)
         self.packer  = SnapshotPacker(extra_keys=["sum_bid_n_usd","sum_ask_n_usd", "cum_imbalance_n_usd"])
 
         # новый: единовременная аллокация матриц
@@ -55,7 +54,7 @@ class Orchestrator:
         self._tg.start(self.on_token)
         # await tg connection
         print("[ORCH] waiting for TG ready...")
-        if not self._tg._ready.wait(timeout=900):
+        if not self._tg._ready.wait(timeout=300):
             raise RuntimeError("Telegram did not become ready in time")
         print("[ORCH] TG ready, starting streams")
 
@@ -63,6 +62,7 @@ class Orchestrator:
         self._depth.start()
         self._thread.start()
 
+        # ===================== debug =======================
         # агрессивно урезаем numpy-печать (на всякий)
         try:
             import numpy as np
@@ -70,6 +70,7 @@ class Orchestrator:
         except Exception:
             print("[ORCH] не удалось настроить numpy-печать")
             pass
+        # ===================================================
 
     def stop(self) -> None:
         self._stop.set()
@@ -119,19 +120,11 @@ class Orchestrator:
                 ai_data = self._depth.get_all_ai_data()
                 t0 = orch_prof.lap(t0, "ai_data")               #profiling
 
-                # dom_all = self._depth.get_all_doms(n=100) 
-                # t0 = orch_prof.lap(t0, "dom")                #profiling
-                # feats = self._depth.get_all_market_data()
-                # t0 = orch_prof.lap(t0, "feats")              #profiling
-                
                 # Вызов упаковщика
                 payload = self.packer.pack(
                     bars=bars,
                     ai_data=ai_data, # Передаем сразу готовые данные
                     S_cap=64,       # та же планка, что и у ActionCodec
-                    # dom_all=dom_all,
-                    # feats=feats,
-                    # symbols_order_hint=None,    # можно передать твой порядок, если нужен
                     debug_timings=self.profiling_activated   #profiling                 
                 )
 
@@ -140,6 +133,7 @@ class Orchestrator:
                 print(active_count)
                 if active_count > 0:
                     first_sym = payload['symbols'][0]
+                    #print(payload)
                     print(f"--- [TEST] Payload OK | Symbols: {active_count} | Lead: {first_sym} ---")
                     # Проверка, что хвосты не пустые (32-й бин для примера)
                     tail_sum = payload['depth_tail_qty'][0].sum()

@@ -62,7 +62,7 @@ class SnapshotPacker:
         self._workspace = _Workspace(
             S_cap=S_cap, dtype=self.dtype,
             mask=np.zeros((S_cap,), dtype=self.dtype),
-            bars_mat=np.zeros((S_cap, 5), dtype=self.dtype),
+            bars_mat=np.zeros((S_cap, 6), dtype=self.dtype),
 
             # Размеры берутся напрямую из настроек
             depth_top_px=np.zeros((S_cap, 2, AI_TOP_N), dtype=self.dtype),
@@ -255,9 +255,11 @@ class SnapshotPacker:
             b = bars_up[s]
             # Быстрая конвертация (предполагаем, что b - объект или dict)
             try:
-                vec = [float(b.o), float(b.h), float(b.l), float(b.c), float(b.v)]
+                vec = [float(b.o), float(b.h), float(b.l), float(b.c), float(b.v), float(b.n)]
             except AttributeError:
+                # Если вдруг пришел словарь (резервный вариант)
                 vec = [float(b.get(k,0)) for k in 'ohlcv']
+                vec.append(float(b.get('n', 0.0)))
             workspace.bars_mat[i] = vec
 
             # 2. AI Data (просто копируем массивы!)
