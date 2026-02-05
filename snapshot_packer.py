@@ -6,8 +6,11 @@ from ws_depth_sampler import DepthSampler
 from time import perf_counter
 from tools.profiling import StepProfiler    #profiling
 
+# Импортируем параметры из менеджера, чтобы знать размеры
+from ws_depth_manager import AI_TOP_N, AI_TAIL_BINS
+
 def _bar_to_vec(bar) -> List[float]:
-    """Ожидается объект с атрибутами .o .h .l .c .v (как у твоего Bar1s).
+    """Ожидается объект с атрибутами .o .h .l .c .v (как у Bar1s).
        Если вместо этого dict — попробуем ключи 'o','h','l','c','v'.
     """
     try:
@@ -19,8 +22,8 @@ def _bar_to_vec(bar) -> List[float]:
 @dataclass
 class _Workspace:
     S_cap: int
-    top_n: int
-    tail_bins: int
+    #top_n: int
+    #tail_bins: int
     dtype: np.dtype
     # буферы:
     mask: np.ndarray
@@ -47,38 +50,30 @@ class SnapshotPacker:
       - extra_feats:   (S_cap, M)           (по выбранным ключам из feats; опц.)
     """
 
-    def __init__(
-        self,
-        sampler: Optional[DepthSampler] = None,
-        extra_keys: Optional[List[str]] = None,
-        dtype=np.float32,
-    ):
-        self.sampler = sampler or DepthSampler()
+    def __init__(self, extra_keys: Optional[List[str]] = None, dtype=np.float32):
         # Можно выбрать ключи, которые уже считает твой DepthBooksManager.get_all_features()
-        self.extra_keys = extra_keys or ["sum_bid_n_usd", "sum_ask_n_usd"]
+        self.extra_keys = extra_keys or ["sum_bid_n_usd", "sum_ask_n_usd", "cum_imbalance_n_usd"]
         self.dtype = dtype
         self._workspace: Optional[_Workspace] = None  # лениво аллоцируем
 
      # -------- workspace lifecycle --------
     def alloc_workspace(self, S_cap: int) -> None:
         """Единовременное выделение всех матриц под текущие top_n/tail_bins."""
-        tn = self.sampler.top_n
-        tbins = self.sampler.tail_bins
-        dt = self.dtype
-
         self._workspace = _Workspace(
-            S_cap=S_cap, top_n=tn, tail_bins=tbins, dtype=dt,
-            mask=np.zeros((S_cap,), dtype=dt),
-            bars_mat=np.zeros((S_cap, 5), dtype=dt),
-            depth_top_px=np.zeros((S_cap, 2, tn), dtype=dt),
-            depth_top_qty=np.zeros((S_cap, 2, tn), dtype=dt),
-            depth_tail_qty=np.zeros((S_cap, 2, tbins), dtype=dt),
-            depth_feats=np.zeros((S_cap, 6), dtype=dt),
-            extra_mat=np.zeros((S_cap, len(self.extra_keys)), dtype=dt),
-        )
+            S_cap=S_cap, dtype=self.dtype,
+            mask=np.zeros((S_cap,), dtype=self.dtype),
+            bars_mat=np.zeros((S_cap, 5), dtype=self.dtype),
 
+            # Размеры берутся напрямую из настроек
+            depth_top_px=np.zeros((S_cap, 2, AI_TOP_N), dtype=self.dtype),
+            depth_top_qty=np.zeros((S_cap, 2, AI_TOP_N), dtype=self.dtype),
+            depth_tail_qty=np.zeros((S_cap, 2, AI_TAIL_BINS), dtype=self.dtype),
+            depth_feats=np.zeros((S_cap, 6), dtype=self.dtype),
+            extra_mat=np.zeros((S_cap, len(self.extra_keys)), dtype=self.dtype),
+        )
+    """
     def _ensure_workspace(self, S_cap: int) -> None:
-        """Ре-аллокация только если изменились S_cap/top_n/tail_bins/dtype."""
+        #Ре-аллокация только если изменились S_cap/top_n/tail_bins/dtype.
         need_new = (
             self._workspace is None
             or self._workspace.S_cap != S_cap
@@ -236,3 +231,59 @@ class SnapshotPacker:
             S_cap=S_cap, symbols_order_hint=symbols_order_hint,
             debug_timings=debug_timings
         )
+    """
+    def pack(self, bars: Dict, ai_data: Dict, S_cap: int, debug_timings=False):
+        if self._workspace is None or self._workspace.S_cap != S_cap:
+            self.alloc_workspace(S_cap)
+        workspace = self._workspace
+        
+        # Очистка маски
+        workspace.mask[:] = 0.0
+
+        # Приводим всё к верхнему регистру на лету, чтобы точно поймать пересечение
+        bars_up = {k.upper(): v for k, v in bars.items()}
+        ai_up = {k.upper(): v for k, v in ai_data.items()}
+        
+        # Пересечение символов
+        valid_syms = sorted(list(set(bars_up.keys()) & set(ai_up.keys())))
+        used = valid_syms[:S_cap]
+
+        for i, s in enumerate(used):
+            workspace.mask[i] = 1.0
+            
+            # 1. Bars
+            b = bars_up[s]
+            # Быстрая конвертация (предполагаем, что b - объект или dict)
+            try:
+                vec = [float(b.o), float(b.h), float(b.l), float(b.c), float(b.v)]
+            except AttributeError:
+                vec = [float(b.get(k,0)) for k in 'ohlcv']
+            workspace.bars_mat[i] = vec
+
+            # 2. AI Data (просто копируем массивы!)
+            d = ai_up[s]
+            workspace.depth_top_px[i, 0, :] = d['top_bid_px']
+            workspace.depth_top_px[i, 1, :] = d['top_ask_px']
+            workspace.depth_top_qty[i, 0, :] = d['top_bid_qty']
+            workspace.depth_top_qty[i, 1, :] = d['top_ask_qty']
+            
+            workspace.depth_tail_qty[i, 0, :] = d['tail_bid_qty']
+            workspace.depth_tail_qty[i, 1, :] = d['tail_ask_qty']
+            
+            workspace.depth_feats[i, :] = d['depth_feats']
+
+            # 3. Extra feats
+            extras = d.get('extra_feats', {})
+            for j, k in enumerate(self.extra_keys):
+                workspace.extra_mat[i, j] = extras.get(k, 0.0)
+
+        return {
+            "symbols": used,
+            "mask": workspace.mask,
+            "bars": workspace.bars_mat,
+            "depth_top_px": workspace.depth_top_px,
+            "depth_top_qty": workspace.depth_top_qty,
+            "depth_tail_qty": workspace.depth_tail_qty,
+            "depth_feats": workspace.depth_feats,
+            "extra_feats": workspace.extra_mat
+        }

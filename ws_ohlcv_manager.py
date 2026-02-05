@@ -303,8 +303,8 @@ class StreamManager:
     # ---- публичный геттер для батч-API -----
     def get_all_last_bars(self) -> Dict[str, Optional[Bar1s]]:
         with self._lc_lock:
-            keys = list(self._last_closed.keys())
-            return {k: self._last_closed.get(k) for k in keys}
+            # Возвращаем ключи в UPPER CASE для синхронизации с другими менеджерами
+            return {k.upper(): v for k, v in self._last_closed.items()}
 
 # ---------- Пример ----------
 if __name__ == "__main__":

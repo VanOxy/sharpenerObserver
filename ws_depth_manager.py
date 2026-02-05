@@ -1,25 +1,32 @@
 # file: ws_depth_manager.py
-from config import Config
 import requests
 from websocket import WebSocketApp
 import threading
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, TypedDict
-from operator import itemgetter
+import math
+import numpy as np
 import heapq
 import orjson
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, TypedDict
+from config import Config
+from operator import itemgetter
 
 # --- Config ---
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 BINANCE_FUTURES_API = "https://fapi.binance.com"
-REST_DEPTH_LIMIT = 1000
-CONNECT_TIMEOUT = 10
+REST_DEPTH_LIMIT = 1000 #max, possible: 500, 200, 100
+CONNECT_TIMEOUT = 10 #30 if heavy, mb
 HTTP_TIMEOUT = 5
 
 # --- Manager params ---
 AUTO_EVICT_SEC = Config.TTL_SECONDS
 GC_INTERVAL_SEC = 10
+
+# --- AI Params ---
+AI_TOP_N = 60               # Кол-во лучших уровней цен, которые передаются точно
+AI_TAIL_BINS = 64           # Кол-во «корзин» для дальних уровней.
+AI_TAIL_MAX_BPS = 500.0     # Хвост охватывает 5% движения цены
 
 class DOMLevel(TypedDict):
     px: float
@@ -33,6 +40,19 @@ class DOMSnapshot(TypedDict):
     spread: float
     bids: List[DOMLevel]
     asks: List[DOMLevel]
+    timestamp: float
+
+class AISnapshot(TypedDict):
+    # Готовые numpy массивы для упаковщика
+    top_bid_px: np.ndarray
+    top_bid_qty: np.ndarray
+    top_ask_px: np.ndarray
+    top_ask_qty: np.ndarray
+    tail_bid_qty: np.ndarray
+    tail_ask_qty: np.ndarray
+    depth_feats: np.ndarray # [mid, spread, microprice, imb@k, bid_qty_k, ask_qty_k]
+    extra_feats: Dict[str, float] # slope, wall, etc.
+    timestamp: float
 
 class TokenOrderBook:
     #Стакан
@@ -43,35 +63,26 @@ class TokenOrderBook:
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
         self._lock = threading.RLock()
-
         self._bids: Dict[float, float] = {}
         self._asks: Dict[float, float] = {}
         self._last_update_id: Optional[int] = None
 
-    # --------------------------- Utilities ---------------------------
-    @staticmethod
-    def _parse_price_qty(price_str: str, qty_str: str) -> Tuple[float, float]:
-        #string ['89384.80', '0.026'] -> tuple [89384.80, 0.026]
-        try:
-            return float(price_str), float(qty_str)
-        except (ValueError, TypeError):
-            return 0.0, 0.0
+     # Предварительный расчет лог-шкалы для хвостов
+        # Если tail_bins=32, мы хотим покрыть tail_max_bps логарифмически
+        if AI_TAIL_BINS > 0:
+            # log(1 + x) шкала. 
+            # max_log = log(1 + 50) ≈ 3.93
+            # scale = 32 / 3.93
+            self._log_scale = AI_TAIL_BINS / math.log(1.0 + AI_TAIL_MAX_BPS)
+        else:
+            self._log_scale = 0.0
 
     # ---------------- Snapshot & Updates ----------------
     def load_snapshot(self, bids: List[List[str]], asks: List[List[str]], last_update_id: int) -> None:
         #записывает новые данные, полученные через REST API
         #bids&asks: [['89384.80', '0.026'], ['89384.70', '0.020'], ['89384.60', '0.002'], ..]
-        new_bids = {} 
-        new_asks = {}
-
-        for price, qty in bids:
-            p, q = self._parse_price_qty(price, qty)
-            if q > 0: new_bids[p] = q
-
-        for price, qty in asks:
-            p, q = self._parse_price_qty(price, qty)
-            if q > 0: new_asks[p] = q
-
+        new_bids = {float(price): float(qty) for price, qty in bids if float(qty) > 0}
+        new_asks = {float(price): float(qty) for price, qty in asks if float(qty) > 0}
         with self._lock:
             self._bids = new_bids
             self._asks = new_asks
@@ -80,15 +91,14 @@ class TokenOrderBook:
     def apply_deltas(self, bid_deltas: List[List[str]], ask_deltas: List[List[str]], last_update_id: int) -> None:
         #Принимает изменения (диффы) из WebSocket
         #Если пришел объем 0, цена удаляется из стакана; если больше 0 — обновляется.
-        prepared_bids = [self._parse_price_qty(price, qty) for price, qty in bid_deltas]
-        prepared_asks = [self._parse_price_qty(price, qty) for price, qty in ask_deltas]
-
         with self._lock:
-            for price, qty in prepared_bids:
+            for price_str, qty_str in bid_deltas:
+                price, qty = float(price_str), float(qty_str)
                 if qty == 0: self._bids.pop(price, None)
                 else: self._bids[price] = qty
 
-            for price, qty in prepared_asks:
+            for price_str, qty_str in ask_deltas:
+                price, qty = float(price_str), float(qty_str)
                 if qty == 0: self._asks.pop(price, None)
                 else: self._asks[price] = qty
 
@@ -225,6 +235,133 @@ class TokenOrderBook:
             "spread_usd": float(spread),
             "rel_spread_bps": float(rel_spread_bps), # Относительный спред
         }
+    
+    def _calc_tail_bins_log(self, orders: Dict[float, float], mid: float, exclude_top_px: float, is_bid: bool) -> np.ndarray:
+        """
+        Быстрый расчет хвостов БЕЗ полной сортировки. 
+        Проходим по всем ордерам словаря. Если цена за пределами топа - кидаем в бин.
+        """
+        bins = np.zeros(AI_TAIL_BINS, dtype=np.float32)
+        if mid <= 0: return bins
+
+        # Для Bid: цена < exclude_top_px. Дистанция = (mid - px) / mid
+        # Для Ask: цена > exclude_top_px. Дистанция = (px - mid) / mid
+        
+        for price, qty in orders.items():
+            # Фильтр: берем только те, что хуже Top-N цены
+            if is_bid:
+                if price >= exclude_top_px: continue
+                delta_bps = (mid - price) / mid * 10000.0
+            else:
+                if price <= exclude_top_px: continue
+                delta_bps = (price - mid) / mid * 10000.0
+            
+            if delta_bps <= 0: continue # Ошибка или пересечение спреда
+            
+            # Логарифмический биннинг: idx = log(1 + bps) * scale
+            # +1 чтобы избежать log(0) и сгладить начало
+            idx = int(math.log(1.0 + delta_bps) * self._log_scale)
+            
+            if 0 <= idx < AI_TAIL_BINS:
+                bins[idx] += qty
+            elif idx >= AI_TAIL_BINS:
+                # Все, что дальше max_bps, падает в последний бин (или игнорируется, по вкусу)
+                bins[AI_TAIL_BINS - 1] += qty
+                
+        return bins
+
+    def get_ai_snapshot(self) -> Optional[AISnapshot]:
+        """
+        Генерирует готовые numpy-массивы для нейронки за один вызов лока.
+        Объединяет логику Sampler и Feature extraction.
+        """
+        ts = time.time()
+        with self._lock:
+            if not self._bids or not self._asks:
+                return None
+            
+            # 1. Top-N (самая дорогая операция - сортировка)
+            # Берем N лучших цен
+            top_bids = heapq.nlargest(AI_TOP_N, self._bids.items()) # [(px, qty), ...]
+            top_asks = heapq.nsmallest(AI_TOP_N, self._asks.items())
+            
+            if not top_bids or not top_asks: return None
+
+            best_bid_px = top_bids[0][0]
+            best_ask_px = top_asks[0][0]
+            
+            # Защита от перекрещенного стакана
+            if best_bid_px >= best_ask_px:
+                mid = best_bid_px
+            else:
+                mid = (best_bid_px + best_ask_px) / 2.0
+
+            # 2. Заполняем Top-N массивы
+            t_bid_px = np.zeros(AI_TOP_N, dtype=np.float32)
+            t_bid_qty = np.zeros(AI_TOP_N, dtype=np.float32)
+            t_ask_px = np.zeros(AI_TOP_N, dtype=np.float32)
+            t_ask_qty = np.zeros(AI_TOP_N, dtype=np.float32)
+
+            for i, (p, q) in enumerate(top_bids):
+                t_bid_px[i], t_bid_qty[i] = p, q
+            for i, (p, q) in enumerate(top_asks):
+                t_ask_px[i], t_ask_qty[i] = p, q
+
+            # 3. Считаем хвосты (Tail Bins)
+            # Передаем цену отсечения (последняя цена топа)
+            cutoff_bid = top_bids[-1][0]
+            cutoff_ask = top_asks[-1][0]
+            
+            tail_bids = self._calc_tail_bins_log(self._bids, mid, cutoff_bid, is_bid=True)
+            tail_asks = self._calc_tail_bins_log(self._asks, mid, cutoff_ask, is_bid=False)
+
+            # 4. Считаем Фичи (Fast Feats + Extra Feats)
+            # --- Fast Feats (для вектора) ---
+            spread = best_ask_px - best_bid_px
+            
+            # Microprice
+            bb_qty = top_bids[0][1]
+            ba_qty = top_asks[0][1]
+            micro = (best_ask_px * bb_qty + best_bid_px * ba_qty) / (bb_qty + ba_qty) if (bb_qty+ba_qty) > 0 else mid
+            
+            # Imbalance @ K (например, по топ-10)
+            k_imb = min(10, AI_TOP_N)
+            sum_bid_k = np.sum(t_bid_qty[:k_imb])
+            sum_ask_k = np.sum(t_ask_qty[:k_imb])
+            den_k = sum_bid_k + sum_ask_k
+            imb_k = (sum_bid_k - sum_ask_k) / den_k if den_k > 0 else 0.0
+
+            depth_feats = np.array([mid, spread, micro, imb_k, sum_bid_k, sum_ask_k], dtype=np.float32)
+
+            # --- Extra Feats (Wall, Slope - старая логика, можно упростить) ---
+            # Для упрощения возьмем полные суммы топа
+            sum_bid_N_usd = float(np.sum(t_bid_px * t_bid_qty))
+            sum_ask_N_usd = float(np.sum(t_ask_px * t_ask_qty))
+            
+            # Простой расчет Imbalance по всему Top-N в USD
+            total_vol = sum_bid_N_usd + sum_ask_N_usd
+            cum_imb = (sum_bid_N_usd - sum_ask_N_usd) / total_vol if total_vol > 0 else 0.0
+
+            extra_feats = {
+                "mid_price": mid, # дубль, но пусть будет для совместимости
+                "cum_imbalance_n_usd": cum_imb,
+                "sum_bid_n_usd": sum_bid_N_usd,
+                "sum_ask_n_usd": sum_ask_N_usd,
+                # Slopes и Walls можно считать тут же, если они критичны
+                # Но для скорости пока оставим базовые
+            }
+
+            return {
+                "top_bid_px": t_bid_px,
+                "top_bid_qty": t_bid_qty,
+                "top_ask_px": t_ask_px,
+                "top_ask_qty": t_ask_qty,
+                "tail_bid_qty": tail_bids,
+                "tail_ask_qty": tail_asks,
+                "depth_feats": depth_feats,
+                "extra_feats": extra_feats,
+                "timestamp": ts
+            }
 
 
 class TokenOrderBookWorker(threading.Thread):
@@ -242,7 +379,7 @@ class TokenOrderBookWorker(threading.Thread):
         self._is_synced = False     # "флаг-переключатель" -> после API снэпшота идут WS диффы
 
         self._buffer_lock = threading.Lock()
-        self._buffer: List[Dict] = []
+        self._buffer = []
         self._prev_u: int = 0
 
         self._ws: Optional[WebSocketApp] = None
@@ -250,20 +387,17 @@ class TokenOrderBookWorker(threading.Thread):
     def stop(self):
         self._stop_event.set()
         if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
+            try: self._ws.close()
+            except: pass
 
     def _on_message(self, ws, message: str):
         try:
-            if '"depthUpdate"' not in message: 
-                return
+            if '"depthUpdate"' not in message: return
             
             data = orjson.loads(message)
 
             if not self._is_synced:     # Состояние SYNCING: просто копим в буфер
-                with self._buffer_lock:
+                with self._buffer_lock: 
                     self._buffer.append(data)
             else:                       # Состояние LIVE: применяем мгновенно
                 self._process_event(data)
@@ -276,10 +410,9 @@ class TokenOrderBookWorker(threading.Thread):
         u = int(evt["u"])               #finalUpdateId
         pu = int(evt.get("pu", -1))     #prevFinalUpdateId --> should be (u - 1)
 
-        if not is_first_after_sync:
-            if self._prev_u != 0 and pu != self._prev_u:
-                self._handle_error(f"Data gap detected! Expected pu={self._prev_u} -> but got pu={pu}")
-                return
+        if not is_first_after_sync and self._prev_u != 0 and pu != self._prev_u:
+            self._handle_error(f"Data gap detected! Expected pu={self._prev_u} -> but got pu={pu}")
+            return
 
         # Накатываем изменения
         self.book.apply_deltas(evt["b"], evt["a"], u) 
@@ -321,7 +454,6 @@ class TokenOrderBookWorker(threading.Thread):
         # Но чтобы выполнить синхронизацию ПАРАЛЛЕЛЬНО приему данных, 
         # нам нужно запустить синхронизацию в отдельном маленьком потоке
         threading.Thread(target=self._sync_sequence, daemon=True).start()
-        
         self._ws.run_forever(ping_interval=15, ping_timeout=10)
 
     def _sync_sequence(self):
@@ -387,8 +519,7 @@ class TokenOrderBookWorker(threading.Thread):
 
     def _get_rest_snapshot(self) -> Dict:
         url = f"{BINANCE_FUTURES_API}/fapi/v1/depth"
-        params = {"symbol": self.sym_u, "limit": REST_DEPTH_LIMIT}
-        response = self._session.get(url, params=params, timeout=HTTP_TIMEOUT)
+        response = self._session.get(url, params={"symbol": self.sym_u, "limit": REST_DEPTH_LIMIT}, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         return response.json()
 
@@ -409,7 +540,7 @@ class TokenOrderBooksManager:
         self._session = requests.Session()
         self._stop_event = threading.Event()
         self._auto_evict_sec = int(auto_evict_sec)
-        self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True, name="DepthGC")
+        self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True)
 
     # ---------------- Lifecycle ----------------
     def touch(self, symbol: str) -> bool:
@@ -420,15 +551,15 @@ class TokenOrderBooksManager:
 
         with self._lock:
             tokenState = self._states.get(sym_l)
-            if tokenState is not None:
+            if tokenState:
                 tokenState.last_access_ts = now
                 return True
             
             try:
                 print(f"🚀 Starting Depth stream for {sym_u}")
                 book = TokenOrderBook(sym_u)
-                worker = TokenOrderBookWorker(sym_l, book, session=self._session, verbose=True)
-                self._states[sym_l] = TokenState(book=book, worker=worker, last_access_ts=now)
+                worker = TokenOrderBookWorker(sym_l, book, self._session, verbose=True)
+                self._states[sym_l] = TokenState(book, worker, now)
                 worker.start()
                 return True
             except Exception as e:
@@ -514,6 +645,20 @@ class TokenOrderBooksManager:
             snapshot[token.upper()] = features
             
         return snapshot
+    
+    def get_all_ai_data(self) -> Dict[str, AISnapshot]:
+        #Собирает готовые данные для модели без лишней обработки
+        out = {}
+        with self._lock:
+            states = list(self._states.items())
+        
+        for token, state in states:
+            if not state.worker._is_synced: continue
+            # Вся магия теперь внутри book
+            data = state.book.get_ai_snapshot()
+            if data:
+                out[token.upper()] = data
+        return out
     
 """    
 # --------------------------- Minimal self-test ---------------------------

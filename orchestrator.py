@@ -8,7 +8,6 @@ import math
 from telegram_observer import TelegramObserver
 from ws_ohlcv_manager import StreamManager as AggTrades
 from ws_depth_manager import TokenOrderBooksManager
-from ws_depth_sampler import DepthSampler
 from snapshot_packer import SnapshotPacker
 from action_codec import ActionCodec
 from paper_broker import PaperBroker
@@ -37,8 +36,8 @@ class Orchestrator:
 
         #init features services
         self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)
-        self.sampler = DepthSampler(top_n=40, tail_bins=32, tail_max_bps=50.0)
-        self.packer  = SnapshotPacker(self.sampler, extra_keys=["sum_bid_n_usd","sum_ask_n_usd"])
+        #self.sampler = DepthSampler(top_n=40, tail_bins=32, tail_max_bps=50.0)
+        self.packer  = SnapshotPacker(extra_keys=["sum_bid_n_usd","sum_ask_n_usd", "cum_imbalance_n_usd"])
 
         # новый: единовременная аллокация матриц
         self.packer.alloc_workspace(S_cap=64)
@@ -106,28 +105,46 @@ class Orchestrator:
             if sleep_s > 0:
                 self._stop.wait(timeout=sleep_s)
 
+            # === profiling/debug ===
             orch_prof.reset()           #profiling
             t0 = time.perf_counter()    #profiling
+            #========================
 
             # job
             try:
-                # get data
+                # получение данных
                 bars = self._ohlcv.get_all_last_bars() 
-                t0 = orch_prof.lap(t0, "bars")               #profiling
-                dom_all = self._depth.get_all_doms(n=100) 
-                t0 = orch_prof.lap(t0, "dom")                #profiling
-                feats = self._depth.get_all_market_data()
-                t0 = orch_prof.lap(t0, "feats")              #profiling
+                t0 = orch_prof.lap(t0, "bars")                  #profiling
+                # ВМЕСТО get_all_doms + get_all_market_data берем ОДИН пакет
+                ai_data = self._depth.get_all_ai_data()
+                t0 = orch_prof.lap(t0, "ai_data")               #profiling
 
-                #packer
+                # dom_all = self._depth.get_all_doms(n=100) 
+                # t0 = orch_prof.lap(t0, "dom")                #profiling
+                # feats = self._depth.get_all_market_data()
+                # t0 = orch_prof.lap(t0, "feats")              #profiling
+                
+                # Вызов упаковщика
                 payload = self.packer.pack(
                     bars=bars,
-                    dom_all=dom_all,
-                    feats=feats,
+                    ai_data=ai_data, # Передаем сразу готовые данные
                     S_cap=64,       # та же планка, что и у ActionCodec
-                    symbols_order_hint=None,    # можно передать твой порядок, если нужен
+                    # dom_all=dom_all,
+                    # feats=feats,
+                    # symbols_order_hint=None,    # можно передать твой порядок, если нужен
                     debug_timings=self.profiling_activated   #profiling                 
                 )
+
+                # ============== debug ==============
+                active_count = int(payload['mask'].sum())
+                print(active_count)
+                if active_count > 0:
+                    first_sym = payload['symbols'][0]
+                    print(f"--- [TEST] Payload OK | Symbols: {active_count} | Lead: {first_sym} ---")
+                    # Проверка, что хвосты не пустые (32-й бин для примера)
+                    tail_sum = payload['depth_tail_qty'][0].sum()
+                    print(f"    Sample Tail Volume: {tail_sum:.2f} | Bars: {payload['bars'][0]}")
+                # ===================================
 
                 t0 = orch_prof.lap(t0, "pack_loop_compress_total")  #profiling
                 if self.profiling_activated: 
@@ -157,20 +174,19 @@ class Orchestrator:
                 #print("codec: ")
                 #print("kind: ", kind, "sym_idx: ", sym_idx, "payload :", payload)
 
-                if kind == "trade" and 0 <= sym_idx < len(symbols):
-                    if sym_idx >= len(symbols):
-                        pass  # действие в паддинг — игнор
-                    else:
-                        symbol = symbols[sym_idx]
-                        side_idx = payload // self.codec.K    # 0=buy,1=sell
-                        size_lvl = payload %  self.codec.K    # 0..K-1
-                        side = "buy" if side_idx == 0 else "sell"
-                        # простая дискретизация размеров:
-                        size_table = [0.001, 0.005]      # TODO: вынести в конфиг
-                        size = size_table[size_lvl]
-                        dom_sym = dom_all[symbol]
-                        ts = int(time.time() * 1000)
-                        self.broker.execute_market(ts, symbol, side, size, dom_sym)
+                # if kind == "trade" and 0 <= sym_idx < len(symbols):
+                #     if sym_idx >= len(symbols):
+                #         pass  # действие в паддинг — игнор
+                #     else:
+                #         symbol = symbols[sym_idx]
+                #         side_idx = payload // self.codec.K    # 0=buy,1=sell
+                #         size_lvl = payload %  self.codec.K    # 0..K-1
+                #         side = "buy" if side_idx == 0 else "sell"
+                #         # простая дискретизация размеров:
+                #         size_table = [0.001, 0.005]      # TODO: вынести в конфиг
+                #         size = size_table[size_lvl]
+                #         ts = int(time.time() * 1000)
+                #         self.broker.execute_market(ts, symbol, side, size)
 
             finally:
                 next_tick += 1
