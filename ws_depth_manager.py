@@ -24,9 +24,9 @@ AUTO_EVICT_SEC = Config.TTL_SECONDS
 GC_INTERVAL_SEC = 10
 
 # --- AI Params ---
-AI_TOP_N = 60               # Кол-во лучших уровней цен, которые передаются точно
-AI_TAIL_BINS = 64           # Кол-во «корзин» для дальних уровней.
-AI_TAIL_MAX_BPS = 500.0     # Хвост охватывает 5% движения цены
+AI_TOP_N = Config.AI_TOP_N                  # Кол-во лучших уровней цен, которые передаются точно
+AI_TAIL_BINS = Config.AI_TAIL_BINS          # Кол-во «корзин» для дальних уровней.
+AI_TAIL_MAX_BPS = Config.AI_TAIL_MAX_BPS    # Хвост охватывает 5% движения цены
 
 class DOMLevel(TypedDict):
     px: float

@@ -1,7 +1,12 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from ws_depth_manager import AI_TOP_N, AI_TAIL_BINS
+from config import Config
+
+# --- AI Params ---
+AI_TOP_N = Config.AI_TOP_N                  # Кол-во лучших уровней цен, которые передаются точно
+AI_TAIL_BINS = Config.AI_TAIL_BINS          # Кол-во «корзин» для дальних уровней.
+AI_TAIL_MAX_BPS = Config.AI_TAIL_MAX_BPS    # Хвост охватывает 5% движения цены
 
 class SharpenerEnv(gym.Env):
     def __init__(self, s_cap=64):

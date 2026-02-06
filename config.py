@@ -15,6 +15,11 @@ class Config:
     TTL_SECONDS = float(os.getenv('TTL_SECONDS'))
     AGG_INTERVAL_SEC = float(os.getenv('AGG_INTERVAL_SEC'))
     
+    # --- AI Params ---
+    AI_TOP_N = os.getenv('AI_TOP_N')                # Number of best price levels to be transmitted accurately
+    AI_TAIL_BINS = os.getenv('AI_TAIL_BINS')        # Number of "bins" for distant levels.
+    AI_TAIL_MAX_BPS = os.getenv('AI_TAIL_MAX_BPS')  # The tail covers 5% of the price movement
+    
     PROFILING = True
     
     @classmethod
