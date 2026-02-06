@@ -34,14 +34,12 @@ class Orchestrator:
         self._ohlcv = AggTradesManager()
         self._depth = TokenOrderBooksManager()
 
-        #init features services
-        self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)
+        # data assembler
         self.packer  = SnapshotPacker(extra_keys=["sum_bid_n_usd","sum_ask_n_usd", "cum_imbalance_n_usd"])
-
-        # новый: единовременная аллокация матриц
         self.packer.alloc_workspace(S_cap=64)
 
         #init trading services
+        self.codec = ActionCodec(S_cap=64, K=2)   # S_cap = верхняя планка (маска скроет паддинг)
         self.broker = PaperBroker(csv_path="trades.csv", taker_fee_rate=0.0004)
 
         #threads management
@@ -49,9 +47,9 @@ class Orchestrator:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="OrchestratorLoop", daemon=True)
 
-    # === lifecycle ===
     def start(self) -> None:
         self._tg.start(self.on_token)
+
         # await tg connection
         print("[ORCH] waiting for TG ready...")
         if not self._tg._ready.wait(timeout=300):
@@ -159,28 +157,19 @@ class Orchestrator:
                     continue
 
 
-                # ACTION
+                # ===================== ACTION / AI Interaction ==================================
                 # здесь у вас будет вызов модели → получите дискретное действие `a`
                 a = 0  # заглушка: HOLD
-                kind, sym_idx, payload = self.codec.decode(a)
-                #if iter_idx % 10 == 0:
-                    #print(f"codec: kind={kind} sym_idx={sym_idx} payload={payload}")
-                #print("codec: ")
-                #print("kind: ", kind, "sym_idx: ", sym_idx, "payload :", payload)
 
-                # if kind == "trade" and 0 <= sym_idx < len(symbols):
-                #     if sym_idx >= len(symbols):
-                #         pass  # действие в паддинг — игнор
-                #     else:
-                #         symbol = symbols[sym_idx]
-                #         side_idx = payload // self.codec.K    # 0=buy,1=sell
-                #         size_lvl = payload %  self.codec.K    # 0..K-1
-                #         side = "buy" if side_idx == 0 else "sell"
-                #         # простая дискретизация размеров:
-                #         size_table = [0.001, 0.005]      # TODO: вынести в конфиг
-                #         size = size_table[size_lvl]
-                #         ts = int(time.time() * 1000)
-                #         self.broker.execute_market(ts, symbol, side, size)
+                trade_params = self.codec.decode(a)
+
+                if trade_params: 
+                   self.broker.execute_market(ts, **trade_params)
+                   # Получаем текущий PnL (реализованный + плавающий) из брокера
+                   current_pnl = self.broker.get_total_unrealized_pnl()
+                   # Награда = Изменение профита за последнюю секунду
+                   reward = current_pnl - self.last_pnl
+                   self.last_pnl = current_pnl
 
             finally:
                 next_tick += 1
